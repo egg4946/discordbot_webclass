@@ -26,6 +26,7 @@ export function loadConfig() {
   const config = {
     discordBotToken: required('DISCORD_BOT_TOKEN'),
     discordChannelId: required('DISCORD_CHANNEL_ID'),
+    discordOwnerUserId: process.env.DISCORD_OWNER_USER_ID?.trim() || null,
     webclassLoginUrl: required('WEBCLASS_LOGIN_URL'),
     webclassUserId: required('WEBCLASS_USER_ID'),
     webclassPassword: required('WEBCLASS_PASSWORD'),

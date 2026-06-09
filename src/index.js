@@ -1,7 +1,13 @@
 import { loadConfig } from './config.js';
-import { assignmentEmbed, sendDiscordMessage } from './discord.js';
+import {
+  assignmentEmbed,
+  resolveDiscordOwnerUserId,
+  sendDiscordDm,
+  sendDiscordMessage,
+} from './discord.js';
 import { fetchAssignmentsWithRetry } from './fetch-with-retry.js';
 import { initializeLogger } from './logger.js';
+import { notificationDestination } from './notification-routing.js';
 import { acquireRunLock } from './run-lock.js';
 import {
   loadRuntimeStatus,
@@ -45,7 +51,13 @@ async function main() {
     }
 
     for (const notification of notifications) {
-      await sendDiscordMessage(config, toDiscordPayload(notification));
+      const payload = toDiscordPayload(notification);
+      if (notificationDestination(notification) === 'ownerDm') {
+        const ownerUserId = await resolveDiscordOwnerUserId(config);
+        await sendDiscordDm(config, ownerUserId, payload);
+      } else {
+        await sendDiscordMessage(config, payload);
+      }
     }
 
     await saveState(STATE_PATH, {

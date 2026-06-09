@@ -2,6 +2,7 @@ import {
   ApplicationCommandOptionType,
   Client,
   GatewayIntentBits,
+  MessageFlags,
 } from 'discord.js';
 import {
   buildAssignmentListEmbeds,
@@ -9,6 +10,8 @@ import {
   sortAssignmentsByDeadline,
 } from './assignment-view.js';
 import { loadConfig } from './config.js';
+import { requiresOwner } from './command-access.js';
+import { resolveDiscordOwnerUserId } from './discord.js';
 import { fetchAssignmentsWithRetry } from './fetch-with-retry.js';
 import { initializeLogger } from './logger.js';
 import { loadRuntimeStatus } from './runtime-status.js';
@@ -39,6 +42,10 @@ const COMMANDS = [
     description: '提出期限が最も近い未提出課題を表示します',
   },
   {
+    name: 'webclass-closest',
+    description: '提出状況を問わず、提出期限が最も近い課題を表示します',
+  },
+  {
     name: 'webclass-status',
     description: 'WebClass自動巡回の稼働状態を表示します',
   },
@@ -48,12 +55,14 @@ async function main() {
   const config = loadConfig();
   initializeLogger('bot', config.logRetentionDays);
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+  let ownerUserId = null;
 
   client.once('clientReady', async () => {
+    ownerUserId = await resolveDiscordOwnerUserId(config);
     await registerCommands(client, config);
     console.log(`Logged in as ${client.user.tag}`);
     console.log(
-      'Commands: /webclass-all, /webclass-unsubmitted, /webclass-next, /webclass-status',
+      'Commands: /webclass-all, /webclass-unsubmitted, /webclass-next, /webclass-closest, /webclass-status',
     );
   });
 
@@ -66,9 +75,24 @@ async function main() {
       return;
     }
 
-    await interaction.deferReply();
+    const includeSubmitted =
+      interaction.commandName === 'webclass-all'
+        ? (interaction.options.getBoolean('include-submitted') ?? true)
+        : true;
+    const ownerOnly = requiresOwner(interaction.commandName, includeSubmitted);
+
+    await interaction.deferReply(
+      ownerOnly ? { flags: MessageFlags.Ephemeral } : undefined,
+    );
 
     try {
+      if (ownerOnly && interaction.user.id !== ownerUserId) {
+        await interaction.editReply(
+          'このコマンド（またはオプション）はBot所有者だけが使用できます。',
+        );
+        return;
+      }
+
       if (interaction.commandName === 'webclass-status') {
         await interaction.editReply({
           embeds: [await buildStatusEmbed()],
@@ -99,14 +123,24 @@ async function getAssignments(config) {
 }
 
 async function respondWithAssignments(interaction, assignments) {
-  if (interaction.commandName === 'webclass-next') {
+  if (
+    interaction.commandName === 'webclass-next' ||
+    interaction.commandName === 'webclass-closest'
+  ) {
+    const isUnsubmittedOnly = interaction.commandName === 'webclass-next';
     const nextAssignment = sortAssignmentsByDeadline(
-      assignments.filter(isUnsubmittedAssignment),
+      isUnsubmittedOnly
+        ? assignments.filter(isUnsubmittedAssignment)
+        : assignments.filter((assignment) => assignment.deadlineAt),
     )[0];
     const embeds = buildAssignmentListEmbeds(
       nextAssignment ? [nextAssignment] : [],
-      '提出期限が最も近い未提出課題',
-      '現在、未提出と判定できる課題はありません。',
+      isUnsubmittedOnly
+        ? '提出期限が最も近い未提出課題'
+        : '提出期限が最も近い課題',
+      isUnsubmittedOnly
+        ? '現在、未提出と判定できる課題はありません。'
+        : '現在、提出期限を確認できる課題はありません。',
     );
     await sendPagedEmbeds(interaction, embeds);
     return;
