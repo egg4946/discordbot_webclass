@@ -17,6 +17,11 @@ function optionalList(name) {
     .filter(Boolean);
 }
 
+function optionalPositiveInteger(name, fallback) {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
 export function loadConfig() {
   const config = {
     discordBotToken: required('DISCORD_BOT_TOKEN'),
@@ -26,6 +31,9 @@ export function loadConfig() {
     webclassPassword: required('WEBCLASS_PASSWORD'),
     webclassTargetUrls: optionalList('WEBCLASS_TARGET_URLS'),
     headless: (process.env.WEBCLASS_HEADLESS ?? 'true').toLowerCase() !== 'false',
+    retryAttempts: optionalPositiveInteger('WEBCLASS_RETRY_ATTEMPTS', 3),
+    retryDelayMs: optionalPositiveInteger('WEBCLASS_RETRY_DELAY_MS', 30000),
+    logRetentionDays: optionalPositiveInteger('LOG_RETENTION_DAYS', 30),
   };
 
   assertNanzanWebclassUrl(config.webclassLoginUrl, 'WEBCLASS_LOGIN_URL');

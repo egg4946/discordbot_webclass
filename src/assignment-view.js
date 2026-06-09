@@ -10,7 +10,9 @@ export function isUnsubmittedAssignment(assignment) {
 }
 
 export function buildAssignmentListEmbeds(assignments, title, emptyMessage) {
-  if (assignments.length === 0) {
+  const sortedAssignments = sortAssignmentsByDeadline(assignments);
+
+  if (sortedAssignments.length === 0) {
     return [
       {
         title,
@@ -21,7 +23,10 @@ export function buildAssignmentListEmbeds(assignments, title, emptyMessage) {
     ];
   }
 
-  const pages = chunkLines(assignments.map(formatAssignmentLine), MAX_DESCRIPTION_LENGTH);
+  const pages = chunkLines(
+    sortedAssignments.map(formatAssignmentLine),
+    MAX_DESCRIPTION_LENGTH,
+  );
   return pages.map((lines, index) => ({
     title: pages.length === 1 ? title : `${title} (${index + 1}/${pages.length})`,
     description: lines.join('\n'),
@@ -30,12 +35,31 @@ export function buildAssignmentListEmbeds(assignments, title, emptyMessage) {
   }));
 }
 
+export function sortAssignmentsByDeadline(assignments) {
+  return [...assignments].sort((left, right) => {
+    const leftTime = deadlineTime(left);
+    const rightTime = deadlineTime(right);
+    if (leftTime !== rightTime) {
+      return leftTime - rightTime;
+    }
+    return (left.courseName ?? '').localeCompare(right.courseName ?? '', 'ja');
+  });
+}
+
+function deadlineTime(assignment) {
+  const time = assignment.deadlineAt
+    ? new Date(assignment.deadlineAt).getTime()
+    : Number.POSITIVE_INFINITY;
+  return Number.isNaN(time) ? Number.POSITIVE_INFINITY : time;
+}
+
 function formatAssignmentLine(assignment, index) {
   const title = escapeMarkdown(assignment.title || '無題の課題');
   const course = escapeMarkdown(assignment.courseName || '不明');
   const deadline = escapeMarkdown(assignment.deadlineText || '不明');
+  const unsubmitted = isUnsubmittedAssignment(assignment) ? '\n未提出' : '';
   return truncateLine(
-    `**${index + 1}. ${title}**\n授業: ${course}\n提出期限: ${deadline}`,
+    `**${index + 1}. 授業: ${course}**\n課題名: ${title}\n提出期限: ${deadline}${unsubmitted}`,
   );
 }
 

@@ -25,10 +25,13 @@ export function assignmentEmbed(title, description, assignment, color = 0x2f80ed
   const fields = [];
 
   if (assignment.courseName) {
-    fields.push({ name: '科目', value: assignment.courseName, inline: true });
+    fields.push({ name: '授業', value: assignment.courseName, inline: false });
+  }
+  if (assignment.title) {
+    fields.push({ name: '課題名', value: assignment.title, inline: false });
   }
   if (assignment.deadlineText) {
-    fields.push({ name: '提出期限', value: assignment.deadlineText, inline: true });
+    fields.push({ name: '提出期限', value: assignment.deadlineText, inline: false });
   }
 
   return {
