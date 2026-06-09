@@ -8,6 +8,7 @@ const DEFAULT_STATE = {
 };
 
 const DEADLINE_THRESHOLD_HOURS = 24;
+const TOKYO_TIME_ZONE = 'Asia/Tokyo';
 
 export async function loadState(path) {
   try {
@@ -31,31 +32,107 @@ export async function saveState(path, state) {
 }
 
 export function buildNotifications(previousState, currentAssignments, now = new Date()) {
-  const previousById = new Map(previousState.assignments.map((item) => [item.id, item]));
+  const previousByStableKey = new Map(
+    previousState.assignments.map((item) => [item.stableKey, item]),
+  );
   const notifications = [];
   const notified = { ...previousState.notified };
 
   for (const assignment of currentAssignments) {
-    if (!previousState.isFirstRun && !previousById.has(assignment.id)) {
-      notifications.push({ type: 'newAssignment', assignment });
-    }
-
-    const deadline = assignment.deadlineAt ? new Date(assignment.deadlineAt) : null;
-    if (!deadline || Number.isNaN(deadline.getTime())) {
+    const previous = previousByStableKey.get(assignment.stableKey);
+    const deadline = parseDeadline(assignment.deadlineAt);
+    if (!deadline) {
       continue;
     }
 
+    const reminderKeys = buildReminderKeys(assignment, deadline);
     const hoursLeft = (deadline.getTime() - now.getTime()) / 1000 / 60 / 60;
-    const key = `${assignment.id}:deadline:${DEADLINE_THRESHOLD_HOURS}`;
-    if (hoursLeft > 0 && hoursLeft <= DEADLINE_THRESHOLD_HOURS && !notified[key]) {
+    const isDueToday = isSameTokyoDate(now, deadline);
+    const isWithin24Hours = hoursLeft > 0 && hoursLeft <= DEADLINE_THRESHOLD_HOURS;
+
+    if (!previousState.isFirstRun && !previous) {
+      notifications.push({ type: 'newAssignment', assignment });
+
+      // A new-assignment notification replaces reminders that are already due.
+      if (isWithin24Hours) {
+        notified[reminderKeys.deadline24] = now.toISOString();
+      }
+      if (isDueToday && isUnsubmitted(assignment)) {
+        notified[reminderKeys.dueToday] = now.toISOString();
+      }
+      continue;
+    }
+
+    if (
+      previous &&
+      previous.deadlineAt &&
+      previous.deadlineAt !== assignment.deadlineAt
+    ) {
+      notifications.push({
+        type: 'deadlineChanged',
+        assignment,
+        previousDeadlineText: previous.deadlineText || '不明',
+      });
+    }
+
+    if (
+      hoursLeft > 0 &&
+      isDueToday &&
+      isUnsubmitted(assignment) &&
+      !notified[reminderKeys.dueToday]
+    ) {
+      notifications.push({ type: 'dueTodayUnsubmitted', assignment });
+      notified[reminderKeys.dueToday] = now.toISOString();
+
+      // Avoid sending the 24-hour reminder in the same run.
+      if (isWithin24Hours) {
+        notified[reminderKeys.deadline24] = now.toISOString();
+      }
+      continue;
+    }
+
+    if (isWithin24Hours && !notified[reminderKeys.deadline24]) {
       notifications.push({
         type: 'deadlineSoon',
         assignment,
         threshold: DEADLINE_THRESHOLD_HOURS,
       });
-      notified[key] = new Date().toISOString();
+      notified[reminderKeys.deadline24] = now.toISOString();
     }
   }
 
   return { notifications, notified, firstRun: Boolean(previousState.isFirstRun) };
+}
+
+function buildReminderKeys(assignment, deadline) {
+  const deadlineKey = deadline.toISOString();
+  return {
+    deadline24: `${assignment.stableKey}:${deadlineKey}:deadline24`,
+    dueToday: `${assignment.stableKey}:${deadlineKey}:dueToday`,
+  };
+}
+
+function parseDeadline(value) {
+  if (!value) {
+    return null;
+  }
+  const deadline = new Date(value);
+  return Number.isNaN(deadline.getTime()) ? null : deadline;
+}
+
+function isUnsubmitted(assignment) {
+  return /^(未提出|未受験)$/.test(assignment.status ?? '');
+}
+
+function isSameTokyoDate(left, right) {
+  return formatTokyoDate(left) === formatTokyoDate(right);
+}
+
+function formatTokyoDate(date) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: TOKYO_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
 }

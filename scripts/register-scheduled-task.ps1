@@ -26,7 +26,7 @@ Register-ScheduledTask `
   -Action $action `
   -Trigger $trigger `
   -Settings $settings `
-  -Description "Checks Nanzan WebClass every 3 hours and posts new assignments or 24-hour deadline reminders to Discord." `
+  -Description "Checks Nanzan WebClass every 3 hours and posts assignment and deadline notifications to Discord." `
   -Force | Out-Null
 
 Write-Host "Registered scheduled task: $TaskName"

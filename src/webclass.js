@@ -185,7 +185,7 @@ export function extractAssignments(html, pageUrl) {
     const title = pickTitle($, element, text);
     const deadlineText = pickDeadline($, element, text);
     const deadlineAt = pickDeadlineAt($, element, deadlineText);
-    const status = pickStatus(text);
+    const status = pickStatus($, element, text);
     if (!courseName || !deadlineText || isBadAssignmentTitle(title) || isExpired(deadlineAt)) {
       continue;
     }
@@ -452,9 +452,18 @@ function isExpired(deadlineAt) {
   return Number.isNaN(deadline.getTime()) || deadline.getTime() < Date.now();
 }
 
-function pickStatus(text) {
+function pickStatus($, element, text) {
   const match = text.match(/(未提出|提出済|受付中|終了|未受験|受験済)/);
-  return match ? match[1] : null;
+  if (match) {
+    return match[1];
+  }
+
+  const executionCount = Number($(element).attr('data-exec-count'));
+  if (Number.isFinite(executionCount) && executionCount === 0) {
+    return '未提出';
+  }
+
+  return null;
 }
 
 function normalizeCourseName(value) {
