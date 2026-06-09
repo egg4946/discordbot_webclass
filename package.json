@@ -1,0 +1,20 @@
+{
+  "name": "discordbot_webclass",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bot": "node src/bot.js",
+    "bot:schedule:windows": "powershell -ExecutionPolicy Bypass -File ./scripts/register-bot-startup-task.ps1",
+    "check": "node src/index.js",
+    "inspect:webclass": "node src/inspect-webclass.js",
+    "schedule:windows": "powershell -ExecutionPolicy Bypass -File ./scripts/register-scheduled-task.ps1",
+    "test:discord": "node src/test-discord.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.2.3",
+    "playwright": "^1.57.0"
+  }
+}
