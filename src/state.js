@@ -35,11 +35,18 @@ export function buildNotifications(previousState, currentAssignments, now = new 
   const previousByStableKey = new Map(
     previousState.assignments.map((item) => [item.stableKey, item]),
   );
+  const previousBySourceId = new Map(
+    previousState.assignments
+      .map((item) => [assignmentSourceId(item), item])
+      .filter(([sourceId]) => sourceId),
+  );
   const notifications = [];
   const notified = { ...previousState.notified };
 
   for (const assignment of currentAssignments) {
-    const previous = previousByStableKey.get(assignment.stableKey);
+    const previous =
+      previousByStableKey.get(assignment.stableKey) ||
+      previousBySourceId.get(assignmentSourceId(assignment));
     const deadline = parseDeadline(assignment.deadlineAt);
     if (!deadline) {
       continue;
@@ -83,12 +90,6 @@ export function buildNotifications(previousState, currentAssignments, now = new 
     ) {
       notifications.push({ type: 'dueTodayUnsubmitted', assignment });
       notified[reminderKeys.dueToday] = now.toISOString();
-
-      // Avoid sending the 24-hour reminder in the same run.
-      if (isWithin24Hours) {
-        notified[reminderKeys.deadline24] = now.toISOString();
-      }
-      continue;
     }
 
     if (isWithin24Hours && !notified[reminderKeys.deadline24]) {
@@ -122,6 +123,23 @@ function parseDeadline(value) {
 
 function isUnsubmitted(assignment) {
   return /^(未提出|未受験)$/.test(assignment.status ?? '');
+}
+
+function assignmentSourceId(assignment) {
+  if (assignment.sourceId) {
+    return assignment.sourceId;
+  }
+
+  try {
+    const url = new URL(assignment.url);
+    return (
+      url.searchParams.get('set_contents_id') ||
+      url.pathname.match(/\/contents\/([^/]+)/)?.[1] ||
+      null
+    );
+  } catch {
+    return null;
+  }
 }
 
 function isSameTokyoDate(left, right) {

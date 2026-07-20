@@ -76,7 +76,7 @@ test('notifies when a deadline is within 24 hours but not today in Tokyo', () =>
   assert.deepEqual(result.notifications.map((item) => item.type), ['deadlineSoon']);
 });
 
-test('due-today unsubmitted notification takes priority over 24-hour notification', () => {
+test('due-today DM and shared 24-hour notification are both sent', () => {
   const current = assignment();
   const result = buildNotifications(
     { assignments: [current], notified: {} },
@@ -86,7 +86,28 @@ test('due-today unsubmitted notification takes priority over 24-hour notificatio
 
   assert.deepEqual(result.notifications.map((item) => item.type), [
     'dueTodayUnsubmitted',
+    'deadlineSoon',
   ]);
+});
+
+test('matches an older state entry by WebClass content ID when its title changed', () => {
+  const previous = assignment({
+    stableKey: 'old-title-key',
+    title: 'New',
+    url: 'https://webclass.nanzan-u.ac.jp/webclass/do_contents.php?set_contents_id=same-task',
+  });
+  const current = assignment({
+    stableKey: 'real-title-key',
+    title: '第1回課題',
+    sourceId: 'same-task',
+  });
+  const result = buildNotifications(
+    { assignments: [previous], notified: {} },
+    [current],
+    new Date('2026-06-09T00:00:00.000Z'),
+  );
+
+  assert.deepEqual(result.notifications, []);
 });
 
 test('does not send a due-today notification for a submitted assignment', () => {

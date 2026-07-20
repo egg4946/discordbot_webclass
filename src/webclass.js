@@ -141,9 +141,7 @@ async function discoverTargetUrls(page) {
   });
 
   const currentCourseUrl = isCourseTopUrl(currentUrl) ? [currentUrl] : [];
-  return [...currentCourseUrl, ...urls]
-    .filter((url, index, all) => all.indexOf(url) === index)
-    .slice(0, 80);
+  return dedupeCourseUrls([...currentCourseUrl, ...urls]).slice(0, 80);
 }
 
 async function discoverCourseUrls(page) {
@@ -157,12 +155,31 @@ async function discoverCourseUrls(page) {
     urls.add(url);
   }
 
-  return Array.from(urls);
+  return dedupeCourseUrls(Array.from(urls));
 }
 
 function isCourseTopUrl(value) {
   const url = new URL(value);
   return /^\/webclass\/course\.php\/[^/]+\/(?:login)?$/.test(url.pathname);
+}
+
+function dedupeCourseUrls(values) {
+  const selected = new Map();
+
+  for (const value of values) {
+    const url = new URL(value);
+    const courseId = url.pathname.match(/^\/webclass\/course\.php\/([^/]+)/)?.[1];
+    const key = courseId ? `${url.origin}|${courseId}` : value;
+    const existing = selected.get(key);
+    const isLoginEntry = /\/login\/?$/.test(url.pathname);
+
+    if (!existing || isLoginEntry) {
+      url.hash = '';
+      selected.set(key, url.toString());
+    }
+  }
+
+  return Array.from(selected.values());
 }
 
 export function extractAssignments(html, pageUrl) {
@@ -182,7 +199,7 @@ export function extractAssignments(html, pageUrl) {
 
     const href = $(element).find('a[href]').first().attr('href');
     const url = href ? new URL(href, pageUrl).toString() : pageUrl;
-    const title = pickTitle($, element, text);
+    const title = pickTitle($, element);
     const deadlineText = pickDeadline($, element, text);
     const deadlineAt = pickDeadlineAt($, element, deadlineText);
     const status = pickStatus($, element, text);
@@ -196,6 +213,7 @@ export function extractAssignments(html, pageUrl) {
     candidates.push({
       id,
       stableKey,
+      sourceId: pickSourceId(url),
       courseName,
       title,
       deadlineText,
@@ -206,7 +224,7 @@ export function extractAssignments(html, pageUrl) {
     });
   }
 
-  return candidates;
+  return dedupeAssignments(candidates);
 }
 
 function collectCandidateElements($) {
@@ -255,17 +273,16 @@ function canonicalCandidateElement($, element) {
 }
 
 function dedupeAssignments(assignments) {
-  const seen = new Set();
-  return assignments.filter((assignment) => {
-    const key = `${normalizeCourseName(assignment.courseName)}|${normalizeTitle(
-      assignment.title,
-    )}|${assignment.deadlineText ?? ''}`;
-    if (seen.has(key)) {
-      return false;
+  const unique = new Map();
+
+  for (const assignment of assignments) {
+    const existing = unique.get(assignment.stableKey);
+    if (!existing || deadlineTime(assignment) < deadlineTime(existing)) {
+      unique.set(assignment.stableKey, assignment);
     }
-    seen.add(key);
-    return true;
-  });
+  }
+
+  return Array.from(unique.values());
 }
 
 function normalizeText(value) {
@@ -281,7 +298,7 @@ function isProbableAssignmentElement($, element, text) {
   }
 
   const className = normalizeText($(element).attr('class') ?? '');
-  const title = pickTitle($, element, text);
+  const title = pickTitle($, element);
   if (isBadAssignmentTitle(title)) {
     return false;
   }
@@ -293,22 +310,26 @@ function isProbableAssignmentElement($, element, text) {
   }
 
   const knownTaskKind =
-    /^(レポート|自習|試験|テスト|小テスト)$/.test(category) ||
-    /content-kind-(report|examine|selfstudy)/i.test(className);
+    /^(レポート|試験|テスト|小テスト)$/.test(category) ||
+    /content-kind-(report|examine)/i.test(className);
+  const selfStudyKind =
+    category === '自習' || /content-kind-selfstudy/i.test(className);
   const taskGroup = /(課題|テスト)/.test(findGroupContext($, element));
   const hasDeadline = Boolean(pickDeadline($, element, text));
   const hasUsefulTitle = title.length >= 2 && !isNavigationOrUiText(title);
+  const hasExplicitTaskTitle = /(課題|レポート|小テスト|テスト|試験)/.test(title);
 
   const fallbackTaskEvidence =
     !category && taskGroup && /(レポート|自習|課題|小テスト|テスト|試験)/.test(evidenceText);
-  return hasUsefulTitle && hasDeadline && (knownTaskKind || fallbackTaskEvidence);
+  const requiredSelfStudy = selfStudyKind && hasExplicitTaskTitle;
+  return hasUsefulTitle && hasDeadline && (knownTaskKind || requiredSelfStudy || fallbackTaskEvidence);
 }
 
 function isBadAssignmentTitle(title) {
   const normalized = normalizeText(title);
   return (
     !normalized ||
-    /^(詳細|表示|開始|回答|実行|教材|資料|閲覧|開く|Top|もっと見る|さらに過去の記録を取得)$/i.test(
+    /^(New|新着|詳細|表示|開始|回答|実行|教材|資料|閲覧|開く|Top|もっと見る|さらに過去の記録を取得)$/i.test(
       normalized,
     ) ||
     /^(詳細|表示|開始|回答|実行)$/.test(normalized)
@@ -334,8 +355,8 @@ function findGroupContext($, element) {
   return normalizeText(`${previousHeadings} ${parentText}`);
 }
 
-function pickTitle($, element, fallbackText) {
-  const dataContentsName = normalizeText($(element).attr('data-contents-name') ?? '');
+function pickTitle($, element) {
+  const dataContentsName = cleanTitleCandidate($(element).attr('data-contents-name') ?? '');
   if (dataContentsName && !isBadAssignmentTitle(dataContentsName)) {
     return dataContentsName.slice(0, 120);
   }
@@ -351,20 +372,27 @@ function pickTitle($, element, fallbackText) {
     '.list-group-item-heading a',
     '.list-group-item-heading',
     'a[href*="do_contents"]',
-    'th',
-    'td',
-    'span',
+    'a[href]',
     'strong',
   ];
 
   for (const selector of titleSelectors) {
-    const title = normalizeText($(element).find(selector).first().text());
-    if (title && !isBadAssignmentTitle(title)) {
-      return title.slice(0, 120);
+    for (const candidate of $(element).find(selector).toArray()) {
+      const title = cleanTitleCandidate($(candidate).text());
+      if (title && !isBadAssignmentTitle(title)) {
+        return title.slice(0, 120);
+      }
     }
   }
 
-  return fallbackText.slice(0, 120);
+  return '';
+}
+
+function cleanTitleCandidate(value) {
+  return normalizeText(value)
+    .replace(/^(?:New|新着)\s*/i, '')
+    .replace(/\s+(?:レポート|自習|試験|テスト|小テスト)利用(?:可能)?期間.*$/, '')
+    .trim();
 }
 
 function pickDeadline($, element, text) {
@@ -483,9 +511,28 @@ function cleanCourseName(value) {
 }
 
 function normalizeTitle(value) {
-  return normalizeText(value)
+  return normalizeText(value.normalize('NFKC'))
+    .replace(/^(?:New|新着)\s*/i, '')
     .replace(/[ 　]/g, '')
     .replace(/[第１1]回/g, '第一回')
     .replace(/[第２2]回/g, '第二回')
     .replace(/[第３3]回/g, '第三回');
+}
+
+function pickSourceId(url) {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.searchParams.get('set_contents_id') ||
+      parsed.pathname.match(/\/contents\/([^/]+)/)?.[1] ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+function deadlineTime(assignment) {
+  const time = assignment.deadlineAt ? new Date(assignment.deadlineAt).getTime() : NaN;
+  return Number.isNaN(time) ? Number.POSITIVE_INFINITY : time;
 }
