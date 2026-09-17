@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractAssignments } from '../src/webclass.js';
+import { extractAssignments, unreadablePageReason } from '../src/webclass.js';
 
 const PAGE_URL = 'https://webclass.nanzan-u.ac.jp/webclass/course.php/example/';
 const FUTURE_END_DATE = '4102444740';
@@ -193,4 +193,23 @@ test('a deadline without a year later in the same year stays in this year', () =
   );
 
   assert.equal(new Date(item.deadlineAt).getFullYear(), 2026);
+});
+
+test('a normal course page is readable', () => {
+  assert.equal(unreadablePageReason(page([])), null);
+});
+
+test('error and maintenance pages are treated as unreadable', () => {
+  const maintenance = '<html><body><h1>ただいまシステムメンテナンス中です</h1></body></html>';
+  const systemError = '<html><body><h2>システムエラーが発生しました</h2></body></html>';
+  const blank = '<html><body><p>しばらくしてから再度アクセスしてください。</p></body></html>';
+
+  assert.match(unreadablePageReason(maintenance), /error page/);
+  assert.match(unreadablePageReason(systemError), /error page/);
+  assert.match(unreadablePageReason(blank), /no course name/);
+});
+
+test('a course whose name merely contains "エラー" is still readable', () => {
+  const html = '<html><body><h1 class="course-name">エラー訂正符号論</h1></body></html>';
+  assert.equal(unreadablePageReason(html), null);
 });

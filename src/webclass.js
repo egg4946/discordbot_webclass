@@ -45,11 +45,28 @@ export async function fetchAssignmentSnapshot(config, options = {}) {
       await page.waitForLoadState('domcontentloaded').catch(() => undefined);
     }
 
-    const targetUrls = config.webclassTargetUrls.length
-      ? config.webclassTargetUrls
+    // Pages are reported even when they cannot be read, so `npm run inspect:webclass`
+    // still saves the HTML needed to diagnose login or layout changes.
+    const reportPage = async (html, assignmentCount) => {
+      if (options.onPage) {
+        await options.onPage({
+          url: page.url(),
+          title: await page.title(),
+          assignmentCount,
+        });
+      }
+      if (options.saveDebugHtml) {
+        await options.saveDebugHtml(html, page.url());
+      }
+    };
+
+    const discovery = config.webclassTargetUrls.length
+      ? { urls: config.webclassTargetUrls, failedUrls: [] }
       : await discoverCourseUrls(page);
+    const targetUrls = discovery.urls;
 
     if (targetUrls.length === 0) {
+      await reportPage(await page.content(), 0);
       throw new Error('No WebClass course pages were found. The login may have failed.');
     }
 
@@ -64,33 +81,32 @@ export async function fetchAssignmentSnapshot(config, options = {}) {
         failedUrls.push(targetUrl);
         continue;
       }
-      if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
-        console.warn(`Skipped WebClass page because the session was lost: ${targetUrl}`);
+
+      const html = await page.content();
+      const unreadableReason = (await hasFirstVisible(page, PASSWORD_SELECTORS))
+        ? 'the session was lost'
+        : unreadablePageReason(html);
+      if (unreadableReason) {
+        console.warn(`Skipped WebClass page because ${unreadableReason}: ${targetUrl}`);
         failedUrls.push(targetUrl);
+        await reportPage(html, 0);
         continue;
       }
-      const html = await page.content();
+
       const pageAssignments = extractAssignments(html, page.url());
       assignments.push(...pageAssignments);
-
-      if (options.onPage) {
-        await options.onPage({
-          url: page.url(),
-          title: await page.title(),
-          assignmentCount: pageAssignments.length,
-        });
-      }
-
-      if (options.saveDebugHtml) {
-        await options.saveDebugHtml(html, page.url());
-      }
+      await reportPage(html, pageAssignments.length);
     }
 
     if (failedUrls.length === targetUrls.length) {
       throw new Error(`Could not read any of the ${targetUrls.length} WebClass course pages.`);
     }
 
-    return { assignments: dedupeAssignments(assignments), failedUrls };
+    return {
+      assignments: dedupeAssignments(assignments),
+      // A failed course discovery may have hidden courses, so it counts as a partial failure.
+      failedUrls: [...discovery.failedUrls, ...failedUrls],
+    };
   } finally {
     await browser.close();
   }
@@ -169,15 +185,35 @@ async function discoverTargetUrls(page) {
 async function discoverCourseUrls(page) {
   const urls = new Set(await discoverTargetUrls(page));
   const courseListUrl = new URL('/webclass/', page.url()).toString();
+  let listFailure = null;
 
-  await gotoWebclassPage(page, courseListUrl).catch((error) => {
-    console.warn(`Could not open course list: ${error.message}`);
-  });
-  for (const url of await discoverTargetUrls(page)) {
-    urls.add(url);
+  try {
+    await gotoWebclassPage(page, courseListUrl);
+    if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
+      listFailure = 'the session was lost';
+    }
+  } catch (error) {
+    listFailure = error.message;
   }
 
-  return dedupeCourseUrls(Array.from(urls));
+  if (!listFailure) {
+    const listedUrls = await discoverTargetUrls(page);
+    if (listedUrls.length === 0) {
+      listFailure = 'no course links were found';
+    }
+    for (const url of listedUrls) {
+      urls.add(url);
+    }
+  }
+
+  if (listFailure) {
+    console.warn(`Could not read the course list (${listFailure}). Some courses may be missing.`);
+  }
+
+  return {
+    urls: dedupeCourseUrls(Array.from(urls)),
+    failedUrls: listFailure ? [courseListUrl] : [],
+  };
 }
 
 function isCourseTopUrl(value) {
@@ -204,11 +240,34 @@ function dedupeCourseUrls(values) {
   return Array.from(selected.values());
 }
 
-export function extractAssignments(html, pageUrl, now = new Date()) {
-  const $ = cheerio.load(html);
-  const courseName = cleanCourseName(normalizeText(
+// Returns why a loaded page is not a readable course page, or null if it is one.
+// An error or maintenance page yields no assignments, and treating that as a
+// successful read would drop the course's assignments from the saved state.
+export function unreadablePageReason(html) {
+  const courseName = extractCourseName(cheerio.load(html));
+  if (!courseName) {
+    return 'no course name was found';
+  }
+  // Only phrases typical of error pages, so courses such as "エラー訂正符号" stay readable.
+  if (
+    /(システムエラー|エラーが発生|メンテナンス中|Internal Server Error|Service Unavailable|under maintenance)/i.test(
+      courseName,
+    )
+  ) {
+    return `it looks like an error page (${courseName})`;
+  }
+  return null;
+}
+
+function extractCourseName($) {
+  return cleanCourseName(normalizeText(
     $('.course-name, h1, h2, .course-title, #course-title, .coursename').first().text(),
   ));
+}
+
+export function extractAssignments(html, pageUrl, now = new Date()) {
+  const $ = cheerio.load(html);
+  const courseName = extractCourseName($);
   $('script, style, nav, header, footer, noscript, .modal, .dropdown-menu').remove();
   const candidates = [];
   const candidateElements = collectCandidateElements($);
