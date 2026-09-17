@@ -6,6 +6,7 @@ import {
 } from './discord.js';
 import { fetchAssignmentsWithRetry } from './fetch-with-retry.js';
 import { initializeLogger } from './logger.js';
+import { loadMutedCourses, MUTES_PATH, partitionMutedNotifications } from './mutes.js';
 import { toDiscordPayload } from './notification-payload.js';
 import { notificationDestination } from './notification-routing.js';
 import { acquireRunLock } from './run-lock.js';
@@ -78,7 +79,17 @@ async function main() {
     const { assignments, failedUrls } = await fetchAssignmentsWithRetry(config, {
       fetcher: fetchAssignmentSnapshot,
     });
-    const { notifications, firstRun } = buildNotifications(previousState, assignments);
+    const built = buildNotifications(previousState, assignments);
+    const { firstRun } = built;
+    const { muted, active } = partitionMutedNotifications(
+      built.notifications,
+      await loadMutedCourses(MUTES_PATH),
+    );
+    // Muted notifications come first and count as delivered without being sent.
+    const notifications = [...muted, ...active];
+    if (muted.length) {
+      console.log(`Skipped ${muted.length} notification(s) for muted courses.`);
+    }
     const carriedAssignments = failedUrls.length
       ? carryOverUnfetchedAssignments(previousState.assignments, assignments)
       : [];
@@ -105,6 +116,9 @@ async function main() {
     };
 
     for (const [index, notification] of notifications.entries()) {
+      if (index < muted.length) {
+        continue;
+      }
       const payload = toDiscordPayload(notification);
       try {
         if (notificationDestination(notification) === 'ownerDm') {
@@ -122,7 +136,7 @@ async function main() {
 
     await saveProgress(notifications.length);
 
-    const notificationCount = notifications.length + (firstRun ? 1 : 0);
+    const notificationCount = active.length + (firstRun ? 1 : 0);
     runtimeStatus = markSuccess(
       runtimeStatus,
       assignments.length,

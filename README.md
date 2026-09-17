@@ -45,10 +45,19 @@
 - `/webclass-next`: 提出期限が最も近い未提出課題を表示（所有者専用）
 - `/webclass-closest`: 提出状況を問わず、提出期限が最も近い課題を表示
 - `/webclass-status`: 自動巡回の最終成功時刻や連続失敗数を表示
+- `/webclass-mute`: 指定した授業の自動通知をミュート（所有者専用）
+- `/webclass-unmute`: 授業のミュートを解除（所有者専用）
+- `/webclass-mutes`: ミュート中の授業を表示（所有者専用）
 
 `/webclass-all` の `include-submitted` オプションを `False` にすると、提出済み課題を除外できます。このオプションは所有者専用です。課題一覧は提出期限が近い順に表示されます。
 
 コマンドはWebClassへ直接アクセスせず、定期巡回が保存した `data/state.json` の内容を表示します。そのため、提出状況などは最大で巡回間隔（3時間）ぶん古い場合があります。返信には最終巡回の時刻が表示され、巡回が連続で失敗している場合は警告も表示されます。
+
+### 授業ごとのミュート
+
+`/webclass-mute` で授業名を入力すると、直近の巡回で見つかった授業名が候補に表示されます。ミュートした授業は、新規課題・締切変更・24時間前・当日DMのすべての自動通知が送られなくなります。課題一覧を表示するコマンドには引き続き表示されます。
+
+ミュートは `data/mutes.json` に保存され、次回の自動巡回から適用されます。ミュート中に発生した通知は送信済みとして記録するため、ミュートを解除しても過去の通知がまとめて届くことはありません。
 
 コマンドは起動時に `DISCORD_CHANNEL_ID` のチャンネルがあるサーバーへ登録されます。明示的にサーバーを指定したい場合は `.env` に `DISCORD_GUILD_ID` を追加してください。
 
@@ -61,6 +70,7 @@ discordbot_webclass/
 │   ├── index.js                # WebClass確認と自動通知（npm run check）
 │   ├── webclass.js             # WebClassログイン・課題抽出
 │   ├── state.js                # 前回との差分、通知済み状態
+│   ├── mutes.js                # 授業ごとのミュート
 │   ├── discord.js              # Discord API送信
 │   ├── notification-payload.js # 通知メッセージの内容
 │   └── config.js               # 環境変数読み込み
@@ -70,6 +80,7 @@ discordbot_webclass/
 ├── data/                       # 実行時に作成（Git管理外）
 │   ├── state.json              # 課題と通知済み情報
 │   ├── runtime-status.json     # 最終巡回成功時刻、連続失敗数
+│   ├── mutes.json              # ミュート中の授業
 │   └── check.lock              # 二重実行防止
 ├── logs/                       # 実行時に作成（Git管理外）
 └── .env                        # トークン・ID・パスワード（Git管理外）

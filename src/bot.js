@@ -13,6 +13,17 @@ import { loadConfig } from './config.js';
 import { requiresOwner } from './command-access.js';
 import { resolveDiscordOwnerUserId } from './discord.js';
 import { initializeLogger } from './logger.js';
+import {
+  addMutedCourse,
+  courseChoices,
+  courseKey,
+  isMutedCourse,
+  loadMutedCourses,
+  MUTES_PATH,
+  removeMutedCourse,
+  saveMutedCourses,
+  uniqueCourseNames,
+} from './mutes.js';
 import { loadRuntimeStatus } from './runtime-status.js';
 import { activeAssignments, loadState, STATE_PATH } from './state.js';
 
@@ -48,7 +59,41 @@ const COMMANDS = [
     name: 'webclass-status',
     description: 'WebClass自動巡回の稼働状態を表示します',
   },
+  {
+    name: 'webclass-mute',
+    description: '指定した授業の自動通知をミュートします（所有者専用）',
+    options: [
+      {
+        type: ApplicationCommandOptionType.String,
+        name: 'course',
+        description: 'ミュートする授業名',
+        required: true,
+        autocomplete: true,
+      },
+    ],
+  },
+  {
+    name: 'webclass-unmute',
+    description: '授業の自動通知のミュートを解除します（所有者専用）',
+    options: [
+      {
+        type: ApplicationCommandOptionType.String,
+        name: 'course',
+        description: 'ミュートを解除する授業名',
+        required: true,
+        autocomplete: true,
+      },
+    ],
+  },
+  {
+    name: 'webclass-mutes',
+    description: 'ミュート中の授業を表示します（所有者専用）',
+  },
 ];
+
+const MUTE_COMMANDS = new Set(['webclass-mute', 'webclass-unmute', 'webclass-mutes']);
+// Serializes read-modify-write of the mute file when commands arrive at the same time.
+let muteUpdateQueue = Promise.resolve();
 
 async function main() {
   const config = loadConfig();
@@ -60,12 +105,17 @@ async function main() {
     ownerUserId = await resolveDiscordOwnerUserId(config);
     await registerCommands(client, config);
     console.log(`Logged in as ${client.user.tag}`);
-    console.log(
-      'Commands: /webclass-all, /webclass-unsubmitted, /webclass-next, /webclass-closest, /webclass-status',
-    );
+    console.log(`Commands: ${COMMANDS.map((command) => `/${command.name}`).join(', ')}`);
   });
 
   client.on('interactionCreate', async (interaction) => {
+    if (interaction.isAutocomplete()) {
+      await respondToCourseAutocomplete(interaction, ownerUserId).catch((error) => {
+        console.error(error);
+      });
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) {
       return;
     }
@@ -99,6 +149,11 @@ async function main() {
         return;
       }
 
+      if (MUTE_COMMANDS.has(interaction.commandName)) {
+        await handleMuteCommand(interaction);
+        return;
+      }
+
       // Commands answer from the last scheduled check instead of launching a browser.
       const state = await loadState(STATE_PATH);
       if (state.isFirstRun) {
@@ -122,6 +177,78 @@ async function main() {
   });
 
   await client.login(config.discordBotToken);
+}
+
+async function respondToCourseAutocomplete(interaction, ownerUserId) {
+  if (!MUTE_COMMANDS.has(interaction.commandName) || interaction.user.id !== ownerUserId) {
+    await interaction.respond([]);
+    return;
+  }
+
+  const mutedCourses = await loadMutedCourses(MUTES_PATH);
+  const query = interaction.options.getFocused();
+  if (interaction.commandName === 'webclass-unmute') {
+    await interaction.respond(courseChoices(mutedCourses, query));
+    return;
+  }
+
+  const state = await loadState(STATE_PATH);
+  const candidates = uniqueCourseNames(state.assignments).filter(
+    (name) => !isMutedCourse(mutedCourses, name),
+  );
+  await interaction.respond(courseChoices(candidates, query));
+}
+
+async function handleMuteCommand(interaction) {
+  if (interaction.commandName === 'webclass-mutes') {
+    const mutedCourses = await loadMutedCourses(MUTES_PATH);
+    await interaction.editReply(
+      mutedCourses.length
+        ? `🔇 ミュート中の授業（${mutedCourses.length}件）\n${mutedCourses.map((name) => `- ${name}`).join('\n')}`
+        : 'ミュート中の授業はありません。',
+    );
+    return;
+  }
+
+  const input = interaction.options.getString('course', true).trim();
+  if (!input) {
+    await interaction.editReply('授業名を入力してください。');
+    return;
+  }
+
+  const update = muteUpdateQueue.then(async () => {
+    const mutedCourses = await loadMutedCourses(MUTES_PATH);
+
+    if (interaction.commandName === 'webclass-unmute') {
+      const result = removeMutedCourse(mutedCourses, input);
+      if (!result.changed) {
+        return `「${input}」はミュートされていません。`;
+      }
+      await saveMutedCourses(MUTES_PATH, result.courses);
+      return `🔔 「${input}」のミュートを解除しました。次回の自動巡回から通知が届きます。`;
+    }
+
+    // Prefer the exact name WebClass uses, so the saved entry matches future checks.
+    const state = await loadState(STATE_PATH);
+    const knownName = uniqueCourseNames(state.assignments).find(
+      (name) => courseKey(name) === courseKey(input),
+    );
+    const courseName = knownName ?? input;
+    const result = addMutedCourse(mutedCourses, courseName);
+    if (!result.changed) {
+      return `「${courseName}」は既にミュートしています。`;
+    }
+    await saveMutedCourses(MUTES_PATH, result.courses);
+
+    const unknownNote = knownName
+      ? ''
+      : '\n※ 現在の課題データにこの授業名はありません。WebClassの授業名と一致した場合に通知から除外されます。';
+    return `🔇 「${courseName}」の自動通知（新規課題・締切変更・24時間前・当日DM）をミュートしました。次回の自動巡回から適用されます。${unknownNote}`;
+  });
+  // Keep the queue usable even if this update fails.
+  muteUpdateQueue = update.catch(() => undefined);
+
+  await interaction.editReply(await update);
 }
 
 async function buildDataNote(state) {
