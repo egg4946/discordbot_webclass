@@ -16,11 +16,11 @@ import { initializeLogger } from './logger.js';
 import {
   addMutedCourse,
   courseChoices,
-  courseKey,
   isMutedCourse,
   loadMutedCourses,
   MUTES_PATH,
   removeMutedCourse,
+  resolveCourseInput,
   saveMutedCourses,
   uniqueCourseNames,
 } from './mutes.js';
@@ -220,30 +220,35 @@ async function handleMuteCommand(interaction) {
     const mutedCourses = await loadMutedCourses(MUTES_PATH);
 
     if (interaction.commandName === 'webclass-unmute') {
-      const result = removeMutedCourse(mutedCourses, input);
+      const course = resolveCourseInput(input, mutedCourses);
+      const result = course ? removeMutedCourse(mutedCourses, course.name) : { changed: false };
       if (!result.changed) {
-        return `「${input}」はミュートされていません。`;
+        return course
+          ? `「${course.name}」はミュートされていません。`
+          : '選択した授業はミュートされていません。';
       }
       await saveMutedCourses(MUTES_PATH, result.courses);
-      return `🔔 「${input}」のミュートを解除しました。次回の自動巡回から通知が届きます。`;
+      return `🔔 「${course.name}」のミュートを解除しました。次回の自動巡回から通知が届きます。`;
     }
 
     // Prefer the exact name WebClass uses, so the saved entry matches future checks.
     const state = await loadState(STATE_PATH);
-    const knownName = uniqueCourseNames(state.assignments).find(
-      (name) => courseKey(name) === courseKey(input),
-    );
-    const courseName = knownName ?? input;
-    const result = addMutedCourse(mutedCourses, courseName);
+    const course =
+      resolveCourseInput(input, uniqueCourseNames(state.assignments)) ??
+      resolveCourseInput(input, mutedCourses);
+    if (!course) {
+      return '選択した授業が見つかりませんでした。もう一度候補から選んでください。';
+    }
+    const result = addMutedCourse(mutedCourses, course.name);
     if (!result.changed) {
-      return `「${courseName}」は既にミュートしています。`;
+      return `「${course.name}」は既にミュートしています。`;
     }
     await saveMutedCourses(MUTES_PATH, result.courses);
 
-    const unknownNote = knownName
+    const unknownNote = course.known
       ? ''
       : '\n※ 現在の課題データにこの授業名はありません。WebClassの授業名と一致した場合に通知から除外されます。';
-    return `🔇 「${courseName}」の自動通知（新規課題・締切変更・24時間前・当日DM）をミュートしました。次回の自動巡回から適用されます。${unknownNote}`;
+    return `🔇 「${course.name}」の自動通知（新規課題・締切変更・24時間前・当日DM）をミュートしました。次回の自動巡回から適用されます。${unknownNote}`;
   });
   // Keep the queue usable even if this update fails.
   muteUpdateQueue = update.catch(() => undefined);

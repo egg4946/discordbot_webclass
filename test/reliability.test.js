@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { discordRequest } from '../src/discord.js';
 import { fetchAssignmentsWithRetry } from '../src/fetch-with-retry.js';
@@ -73,9 +73,12 @@ test('stale run locks are replaced', async () => {
   const lockPath = join(directory, 'check.lock');
   await mkdir(directory, { recursive: true });
   await writeFile(lockPath, 'stale', 'utf8');
+  // Backdate the lock explicitly; a fresh file's mtime can be slightly ahead of Date.now().
+  const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  await utimes(lockPath, anHourAgo, anHourAgo);
 
   try {
-    const release = await acquireRunLock(lockPath, -1);
+    const release = await acquireRunLock(lockPath, 60 * 1000);
     assert.equal(typeof release, 'function');
     await release();
   } finally {

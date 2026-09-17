@@ -9,6 +9,7 @@ import {
   loadMutedCourses,
   partitionMutedNotifications,
   removeMutedCourse,
+  resolveCourseInput,
   saveMutedCourses,
   uniqueCourseNames,
 } from '../src/mutes.js';
@@ -82,9 +83,41 @@ test('autocomplete choices are unique, filtered, and within Discord limits', () 
   ]);
   assert.equal(names.length, 3);
 
-  assert.deepEqual(courseChoices(names, '統計'), [{ name: '統計学概論2', value: '統計学概論2' }]);
-  assert.ok(courseChoices(names, '').every((choice) => choice.value.length <= 100));
+  const [statistics] = courseChoices(names, '統計');
+  assert.equal(statistics.name, '統計学概論2');
+  assert.equal(resolveCourseInput(statistics.value, names).name, '統計学概論2');
+  assert.ok(
+    courseChoices(names, '').every((choice) => choice.name.length <= 100 && choice.value.length <= 100),
+  );
 
   const many = Array.from({ length: 40 }, (_, index) => `授業${index}`);
   assert.equal(courseChoices(many, '').length, 25);
+});
+
+test('a course name longer than 100 characters can be muted and unmuted from its choice', () => {
+  const longName = `情報${'あ'.repeat(99)}`;
+  assert.equal(longName.length, 101);
+
+  const [muteChoice] = courseChoices([longName, '科学技術論B'], '情報');
+  const muteTarget = resolveCourseInput(muteChoice.value, [longName, '科学技術論B']);
+  assert.deepEqual(muteTarget, { name: longName, known: true });
+
+  const { courses } = addMutedCourse([], muteTarget.name);
+  assert.equal(isMutedCourse(courses, longName), true);
+
+  const [unmuteChoice] = courseChoices(courses, '');
+  const unmuteTarget = resolveCourseInput(unmuteChoice.value, courses);
+  assert.deepEqual(removeMutedCourse(courses, unmuteTarget.name), { courses: [], changed: true });
+});
+
+test('typed course names resolve to the known name, and stale choices resolve to nothing', () => {
+  assert.deepEqual(resolveCourseInput('科学技術論Ｂ', ['科学技術論B']), {
+    name: '科学技術論B',
+    known: true,
+  });
+  assert.deepEqual(resolveCourseInput('未知の授業', ['科学技術論B']), {
+    name: '未知の授業',
+    known: false,
+  });
+  assert.equal(resolveCourseInput('course:0000000000000000', ['科学技術論B']), null);
 });
