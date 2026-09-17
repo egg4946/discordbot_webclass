@@ -12,13 +12,12 @@ import {
 import { loadConfig } from './config.js';
 import { requiresOwner } from './command-access.js';
 import { resolveDiscordOwnerUserId } from './discord.js';
-import { fetchAssignmentsWithRetry } from './fetch-with-retry.js';
 import { initializeLogger } from './logger.js';
 import { loadRuntimeStatus } from './runtime-status.js';
+import { activeAssignments, loadState, STATE_PATH } from './state.js';
 
 const RUNTIME_STATUS_PATH = 'data/runtime-status.json';
 const startedAt = new Date();
-let activeFetch = null;
 
 const COMMANDS = [
   {
@@ -100,12 +99,24 @@ async function main() {
         return;
       }
 
-      const assignments = await getAssignments(config);
-      await respondWithAssignments(interaction, assignments);
+      // Commands answer from the last scheduled check instead of launching a browser.
+      const state = await loadState(STATE_PATH);
+      if (state.isFirstRun) {
+        await interaction.editReply(
+          'まだ自動巡回のデータがありません。次回の自動巡回（3時間ごと）の後に試してください。',
+        );
+        return;
+      }
+
+      const context = {
+        ephemeral: ownerOnly,
+        content: await buildDataNote(state),
+      };
+      await respondWithAssignments(interaction, activeAssignments(state.assignments), context);
     } catch (error) {
       console.error(error);
       await interaction.editReply(
-        'WebClassの取得中にエラーが発生しました。再試行にも失敗したため、しばらくしてから試してください。',
+        '課題データの読み込み中にエラーが発生しました。しばらくしてから試してください。',
       );
     }
   });
@@ -113,16 +124,22 @@ async function main() {
   await client.login(config.discordBotToken);
 }
 
-async function getAssignments(config) {
-  if (!activeFetch) {
-    activeFetch = fetchAssignmentsWithRetry(config).finally(() => {
-      activeFetch = null;
-    });
+async function buildDataNote(state) {
+  const lines = [];
+  if (state.updatedAt) {
+    lines.push(`最終巡回: ${discordTime(state.updatedAt)}`);
   }
-  return activeFetch;
+
+  const status = await loadRuntimeStatus(RUNTIME_STATUS_PATH);
+  if (status.consecutiveFailures > 0) {
+    lines.push(
+      `⚠️ 直近の自動巡回が${status.consecutiveFailures}回連続で失敗しているため、情報が古い可能性があります。`,
+    );
+  }
+  return lines.join('\n') || undefined;
 }
 
-async function respondWithAssignments(interaction, assignments) {
+async function respondWithAssignments(interaction, assignments, context) {
   if (
     interaction.commandName === 'webclass-next' ||
     interaction.commandName === 'webclass-closest'
@@ -142,7 +159,7 @@ async function respondWithAssignments(interaction, assignments) {
         ? '現在、未提出と判定できる課題はありません。'
         : '現在、提出期限を確認できる課題はありません。',
     );
-    await sendPagedEmbeds(interaction, embeds);
+    await sendPagedEmbeds(interaction, embeds, context);
     return;
   }
 
@@ -166,7 +183,7 @@ async function respondWithAssignments(interaction, assignments) {
       : '課題は見つかりませんでした。',
   );
 
-  await sendPagedEmbeds(interaction, embeds);
+  await sendPagedEmbeds(interaction, embeds, context);
 }
 
 async function buildStatusEmbed() {
@@ -224,12 +241,16 @@ function truncate(value, maxLength) {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 }
 
-async function sendPagedEmbeds(interaction, embeds) {
+async function sendPagedEmbeds(interaction, embeds, { ephemeral, content }) {
   const [firstEmbed, ...restEmbeds] = embeds;
-  await interaction.editReply({ embeds: [firstEmbed] });
+  await interaction.editReply({ content, embeds: [firstEmbed] });
 
+  // Follow-ups are public by default, so owner-only lists must stay ephemeral explicitly.
   for (const embed of restEmbeds) {
-    await interaction.followUp({ embeds: [embed] });
+    await interaction.followUp({
+      embeds: [embed],
+      ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {}),
+    });
   }
 }
 

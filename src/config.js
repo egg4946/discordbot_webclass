@@ -1,6 +1,7 @@
 import 'dotenv/config';
 
 const ALLOWED_WEBCLASS_HOST = 'webclass.nanzan-u.ac.jp';
+const MAX_CHECK_TIMEOUT_MINUTES = 100;
 
 function required(name) {
   const value = process.env[name];
@@ -35,6 +36,12 @@ export function loadConfig() {
     retryAttempts: optionalPositiveInteger('WEBCLASS_RETRY_ATTEMPTS', 3),
     retryDelayMs: optionalPositiveInteger('WEBCLASS_RETRY_DELAY_MS', 30000),
     logRetentionDays: optionalPositiveInteger('LOG_RETENTION_DAYS', 30),
+    // Must stay below the run lock's stale age (2 hours) so a hung check always ends
+    // before the next run may take over its lock.
+    checkTimeoutMinutes: Math.min(
+      optionalPositiveInteger('CHECK_TIMEOUT_MINUTES', 60),
+      MAX_CHECK_TIMEOUT_MINUTES,
+    ),
   };
 
   assertNanzanWebclassUrl(config.webclassLoginUrl, 'WEBCLASS_LOGIN_URL');

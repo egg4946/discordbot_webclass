@@ -91,3 +91,106 @@ test('explicitly named tasks remain eligible even when WebClass calls them self-
   assert.equal(assignments.length, 1);
   assert.equal(assignments[0].title, '第１回課題');
 });
+
+test('titles that merely start with "New" are not truncated', () => {
+  const assignments = extractAssignments(
+    page([
+      content({
+        title: 'Newton法レポート',
+        category: 'レポート',
+        kind: 'content-kind-report',
+        id: 'newton-report',
+      }),
+    ]),
+    PAGE_URL,
+  );
+
+  assert.equal(assignments.length, 1);
+  assert.equal(assignments[0].title, 'Newton法レポート');
+});
+
+test('different contents sharing a title are kept separately', () => {
+  const assignments = extractAssignments(
+    page([
+      content({
+        title: 'レポート課題',
+        category: 'レポート',
+        kind: 'content-kind-report',
+        id: 'report-a',
+      }),
+      content({
+        title: 'レポート課題',
+        category: 'レポート',
+        kind: 'content-kind-report',
+        id: 'report-b',
+      }),
+    ]),
+    PAGE_URL,
+  );
+
+  assert.deepEqual(
+    assignments.map((item) => item.sourceId).sort(),
+    ['report-a', 'report-b'],
+  );
+});
+
+test('table rows with a plain-text title cell are detected', () => {
+  const html = page([
+    `<table class="cl-contentsList"><tbody>
+      <tr class="content-kind-report">
+        <td>第3回レポート</td>
+        <td>提出期限 2099/12/31 23:59</td>
+        <td><a href="/webclass/do_contents.php?set_contents_id=table-report">詳細</a></td>
+      </tr>
+    </tbody></table>`,
+  ]);
+  const assignments = extractAssignments(html, PAGE_URL);
+
+  assert.equal(assignments.length, 1);
+  assert.equal(assignments[0].title, '第3回レポート');
+});
+
+function textDeadlinePage(deadline) {
+  return page([
+    `<div class="cl-contentsList_listGroupItem content-kind-report">
+      <div class="cm-contentsList_contentName">
+        <a href="/webclass/do_contents.php?set_contents_id=no-year">第5回レポート</a>
+      </div>
+      <span class="cl-contentsList_categoryLabel">レポート</span>
+      <span>提出期限 ${deadline}</span>
+    </div>`,
+  ]);
+}
+
+test('a January deadline without a year read in December belongs to next year', () => {
+  const [item] = extractAssignments(
+    textDeadlinePage('1/10 23:59'),
+    PAGE_URL,
+    new Date(2026, 11, 20, 12, 0),
+  );
+
+  const deadline = new Date(item.deadlineAt);
+  assert.equal(deadline.getFullYear(), 2027);
+  assert.equal(deadline.getMonth(), 0);
+  assert.equal(deadline.getDate(), 10);
+});
+
+test('a December deadline without a year read in January is last year and expired', () => {
+  const assignments = extractAssignments(
+    textDeadlinePage('12/25 23:59'),
+    PAGE_URL,
+    new Date(2027, 0, 5, 12, 0),
+  );
+
+  assert.deepEqual(assignments, []);
+});
+
+test('a deadline without a year later in the same year stays in this year', () => {
+  const [item] = extractAssignments(
+    textDeadlinePage('10/1 23:59'),
+    PAGE_URL,
+    new Date(2026, 8, 17, 12, 0),
+  );
+
+  assert.equal(new Date(item.deadlineAt).getFullYear(), 2026);
+});

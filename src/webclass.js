@@ -26,6 +26,13 @@ const SUBMIT_SELECTORS = [
 ];
 
 export async function fetchAssignments(config, options = {}) {
+  const { assignments } = await fetchAssignmentSnapshot(config, options);
+  return assignments;
+}
+
+// Returns the assignments together with the course pages that could not be read,
+// so callers can avoid treating a partial result as the complete list.
+export async function fetchAssignmentSnapshot(config, options = {}) {
   const browser = await chromium.launch({ headless: config.headless });
   const page = await browser.newPage({ locale: 'ja-JP', timezoneId: 'Asia/Tokyo' });
 
@@ -42,13 +49,24 @@ export async function fetchAssignments(config, options = {}) {
       ? config.webclassTargetUrls
       : await discoverCourseUrls(page);
 
+    if (targetUrls.length === 0) {
+      throw new Error('No WebClass course pages were found. The login may have failed.');
+    }
+
     const assignments = [];
+    const failedUrls = [];
     for (const targetUrl of targetUrls) {
       try {
         await gotoWebclassPage(page, targetUrl);
       } catch (error) {
         console.warn(`Skipped WebClass page after navigation failure: ${targetUrl}`);
         console.warn(error.message);
+        failedUrls.push(targetUrl);
+        continue;
+      }
+      if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
+        console.warn(`Skipped WebClass page because the session was lost: ${targetUrl}`);
+        failedUrls.push(targetUrl);
         continue;
       }
       const html = await page.content();
@@ -68,7 +86,11 @@ export async function fetchAssignments(config, options = {}) {
       }
     }
 
-    return dedupeAssignments(assignments);
+    if (failedUrls.length === targetUrls.length) {
+      throw new Error(`Could not read any of the ${targetUrls.length} WebClass course pages.`);
+    }
+
+    return { assignments: dedupeAssignments(assignments), failedUrls };
   } finally {
     await browser.close();
   }
@@ -182,7 +204,7 @@ function dedupeCourseUrls(values) {
   return Array.from(selected.values());
 }
 
-export function extractAssignments(html, pageUrl) {
+export function extractAssignments(html, pageUrl, now = new Date()) {
   const $ = cheerio.load(html);
   const courseName = cleanCourseName(normalizeText(
     $('.course-name, h1, h2, .course-title, #course-title, .coursename').first().text(),
@@ -201,9 +223,9 @@ export function extractAssignments(html, pageUrl) {
     const url = href ? new URL(href, pageUrl).toString() : pageUrl;
     const title = pickTitle($, element);
     const deadlineText = pickDeadline($, element, text);
-    const deadlineAt = pickDeadlineAt($, element, deadlineText);
+    const deadlineAt = pickDeadlineAt($, element, deadlineText, now);
     const status = pickStatus($, element, text);
-    if (!courseName || !deadlineText || isBadAssignmentTitle(title) || isExpired(deadlineAt)) {
+    if (!courseName || !deadlineText || isBadAssignmentTitle(title) || isExpired(deadlineAt, now)) {
       continue;
     }
 
@@ -276,9 +298,13 @@ function dedupeAssignments(assignments) {
   const unique = new Map();
 
   for (const assignment of assignments) {
-    const existing = unique.get(assignment.stableKey);
+    // Different contents can share a title, so prefer the WebClass content ID.
+    const key = assignment.sourceId
+      ? `source:${assignment.sourceId}`
+      : `key:${assignment.stableKey}|${assignment.deadlineText ?? ''}`;
+    const existing = unique.get(key);
     if (!existing || deadlineTime(assignment) < deadlineTime(existing)) {
-      unique.set(assignment.stableKey, assignment);
+      unique.set(key, assignment);
     }
   }
 
@@ -332,7 +358,9 @@ function isBadAssignmentTitle(title) {
     /^(New|新着|詳細|表示|開始|回答|実行|教材|資料|閲覧|開く|Top|もっと見る|さらに過去の記録を取得)$/i.test(
       normalized,
     ) ||
-    /^(詳細|表示|開始|回答|実行)$/.test(normalized)
+    /^(詳細|表示|開始|回答|実行)$/.test(normalized) ||
+    // Date-only cells (e.g. a deadline column) are never titles.
+    /^[\d\s\/\-.:：年月日～〜]+$/.test(normalized)
   );
 }
 
@@ -373,6 +401,8 @@ function pickTitle($, element) {
     '.list-group-item-heading',
     'a[href*="do_contents"]',
     'a[href]',
+    'th',
+    'td',
     'strong',
   ];
 
@@ -389,10 +419,14 @@ function pickTitle($, element) {
 }
 
 function cleanTitleCandidate(value) {
-  return normalizeText(value)
-    .replace(/^(?:New|新着)\s*/i, '')
+  return stripNewBadge(normalizeText(value))
     .replace(/\s+(?:レポート|自習|試験|テスト|小テスト)利用(?:可能)?期間.*$/, '')
     .trim();
+}
+
+// Strip only a standalone badge so titles such as "Newton法" stay intact.
+function stripNewBadge(value) {
+  return value.replace(/^(?:New(?![A-Za-z0-9])|新着)\s*/i, '');
 }
 
 function pickDeadline($, element, text) {
@@ -418,15 +452,15 @@ function pickDeadline($, element, text) {
   return null;
 }
 
-function pickDeadlineAt($, element, deadlineText) {
+function pickDeadlineAt($, element, deadlineText, now) {
   const endDate = Number($(element).attr('data-end-date'));
   if (Number.isFinite(endDate) && endDate > 0) {
     return new Date(endDate * 1000).toISOString();
   }
-  return parseDeadline(deadlineText);
+  return parseDeadline(deadlineText, now);
 }
 
-function parseDeadline(value) {
+function parseDeadline(value, now = new Date()) {
   if (!value) {
     return null;
   }
@@ -446,10 +480,25 @@ function parseDeadline(value) {
 
   const partial = normalized.match(/^(\d{1,2})\/\s*(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/);
   if (partial) {
-    return toLocalIso(new Date().getFullYear(), partial[1], partial[2], partial[3], partial[4]);
+    return closestYearIso(now, partial[1], partial[2], partial[3], partial[4]);
   }
 
   return null;
+}
+
+// A date without a year belongs to whichever of last/this/next year is closest to now,
+// so "1/10" read in December is next January and "12/25" read in January is last December.
+function closestYearIso(now, month, day, hour, minute) {
+  const year = now.getFullYear();
+  const candidates = [year - 1, year, year + 1]
+    .map((candidateYear) => toLocalIso(candidateYear, month, day, hour, minute))
+    .filter(Boolean);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const distance = (iso) => Math.abs(new Date(iso).getTime() - now.getTime());
+  return candidates.reduce((best, iso) => (distance(iso) < distance(best) ? iso : best));
 }
 
 function toLocalIso(year, month, day, hour = '23', minute = '59') {
@@ -472,12 +521,12 @@ function formatLocalDeadline(date) {
   return `${year}/${month}/${day} ${hour}:${minute}`;
 }
 
-function isExpired(deadlineAt) {
+function isExpired(deadlineAt, now) {
   if (!deadlineAt) {
     return true;
   }
   const deadline = new Date(deadlineAt);
-  return Number.isNaN(deadline.getTime()) || deadline.getTime() < Date.now();
+  return Number.isNaN(deadline.getTime()) || deadline.getTime() < now.getTime();
 }
 
 function pickStatus($, element, text) {
@@ -511,8 +560,7 @@ function cleanCourseName(value) {
 }
 
 function normalizeTitle(value) {
-  return normalizeText(value.normalize('NFKC'))
-    .replace(/^(?:New|新着)\s*/i, '')
+  return stripNewBadge(normalizeText(value.normalize('NFKC')))
     .replace(/[ 　]/g, '')
     .replace(/[第１1]回/g, '第一回')
     .replace(/[第２2]回/g, '第二回')

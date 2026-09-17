@@ -15,13 +15,21 @@ import {
   markFailure,
   markSuccess,
   saveRuntimeStatus,
+  shouldNotifyFailure,
+  shouldNotifyRecovery,
 } from './runtime-status.js';
-import { buildNotifications, loadState, saveState } from './state.js';
+import {
+  buildNotifications,
+  buildStateAfterSending,
+  carryOverUnfetchedAssignments,
+  loadState,
+  saveState,
+  STATE_PATH,
+} from './state.js';
+import { fetchAssignmentSnapshot } from './webclass.js';
 
-const STATE_PATH = 'data/state.json';
 const RUNTIME_STATUS_PATH = 'data/runtime-status.json';
 const LOCK_PATH = 'data/check.lock';
-const ERROR_NOTIFICATION_THRESHOLD = 3;
 
 async function main() {
   const config = loadConfig();
@@ -34,15 +42,52 @@ async function main() {
   }
 
   let runtimeStatus = markAttempt(await loadRuntimeStatus(RUNTIME_STATUS_PATH));
+  const previousConsecutiveFailures = runtimeStatus.consecutiveFailures ?? 0;
   await saveRuntimeStatus(RUNTIME_STATUS_PATH, runtimeStatus);
+
+  const recordFailure = async (error) => {
+    runtimeStatus = markFailure(runtimeStatus, error);
+    await saveRuntimeStatus(RUNTIME_STATUS_PATH, runtimeStatus);
+    console.error(error);
+
+    if (shouldNotifyFailure(runtimeStatus)) {
+      await sendFailureNotification(config, runtimeStatus).catch((notificationError) => {
+        console.error('Failed to send WebClass error notification:', notificationError);
+      });
+    }
+  };
+
+  // A hung browser or network call must not keep the lock forever, so the whole
+  // check is aborted after the configured time.
+  const watchdog = setTimeout(async () => {
+    // Exit even if recording the failure itself hangs.
+    setTimeout(() => process.exit(1), 60000).unref();
+    try {
+      await recordFailure(
+        new Error(`WebClass check timed out after ${config.checkTimeoutMinutes} minutes.`),
+      );
+    } finally {
+      await releaseLock().catch(() => undefined);
+      process.exit(1);
+    }
+  }, config.checkTimeoutMinutes * 60 * 1000);
+  watchdog.unref();
 
   try {
     const previousState = await loadState(STATE_PATH);
-    const assignments = await fetchAssignmentsWithRetry(config);
-    const { notifications, notified, firstRun } = buildNotifications(
-      previousState,
-      assignments,
-    );
+    const { assignments, failedUrls } = await fetchAssignmentsWithRetry(config, {
+      fetcher: fetchAssignmentSnapshot,
+    });
+    const { notifications, firstRun } = buildNotifications(previousState, assignments);
+    const carriedAssignments = failedUrls.length
+      ? carryOverUnfetchedAssignments(previousState.assignments, assignments)
+      : [];
+
+    if (failedUrls.length) {
+      console.warn(
+        `Could not read ${failedUrls.length} WebClass page(s); kept ${carriedAssignments.length} previous assignment(s).`,
+      );
+    }
 
     if (firstRun) {
       await sendDiscordMessage(config, {
@@ -50,20 +95,32 @@ async function main() {
       });
     }
 
-    for (const notification of notifications) {
+    // Save after every delivery so a failure or crash midway never re-sends earlier notices.
+    const saveProgress = (sentCount) => {
+      const state = buildStateAfterSending(previousState, assignments, notifications, sentCount);
+      return saveState(STATE_PATH, {
+        assignments: [...state.assignments, ...carriedAssignments],
+        notified: state.notified,
+      });
+    };
+
+    for (const [index, notification] of notifications.entries()) {
       const payload = toDiscordPayload(notification);
-      if (notificationDestination(notification) === 'ownerDm') {
-        const ownerUserId = await resolveDiscordOwnerUserId(config);
-        await sendDiscordDm(config, ownerUserId, payload);
-      } else {
-        await sendDiscordMessage(config, payload);
+      try {
+        if (notificationDestination(notification) === 'ownerDm') {
+          const ownerUserId = await resolveDiscordOwnerUserId(config);
+          await sendDiscordDm(config, ownerUserId, payload);
+        } else {
+          await sendDiscordMessage(config, payload);
+        }
+      } catch (error) {
+        await saveProgress(index);
+        throw error;
       }
+      await saveProgress(index + 1);
     }
 
-    await saveState(STATE_PATH, {
-      assignments,
-      notified,
-    });
+    await saveProgress(notifications.length);
 
     const notificationCount = notifications.length + (firstRun ? 1 : 0);
     runtimeStatus = markSuccess(
@@ -73,24 +130,37 @@ async function main() {
     );
     await saveRuntimeStatus(RUNTIME_STATUS_PATH, runtimeStatus);
 
+    if (shouldNotifyRecovery(previousConsecutiveFailures)) {
+      await sendRecoveryNotification(config, previousConsecutiveFailures).catch(
+        (notificationError) => {
+          console.error('Failed to send WebClass recovery notification:', notificationError);
+        },
+      );
+    }
+
     console.log(
       `Done. assignments=${assignments.length} notifications=${notificationCount}`,
     );
   } catch (error) {
-    runtimeStatus = markFailure(runtimeStatus, error);
-    await saveRuntimeStatus(RUNTIME_STATUS_PATH, runtimeStatus);
-    console.error(error);
-
-    if (runtimeStatus.consecutiveFailures === ERROR_NOTIFICATION_THRESHOLD) {
-      await sendFailureNotification(config, runtimeStatus).catch((notificationError) => {
-        console.error('Failed to send WebClass error notification:', notificationError);
-      });
-    }
-
+    await recordFailure(error);
     process.exitCode = 1;
   } finally {
+    clearTimeout(watchdog);
     await releaseLock();
   }
+}
+
+async function sendRecoveryNotification(config, failureCount) {
+  await sendDiscordMessage(config, {
+    embeds: [
+      {
+        title: 'WebClassの自動取得が復旧しました',
+        description: `**${failureCount}回連続失敗の後、正常に取得できました**`,
+        color: 0x27ae60,
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  });
 }
 
 async function sendFailureNotification(config, runtimeStatus) {
