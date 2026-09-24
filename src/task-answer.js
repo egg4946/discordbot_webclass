@@ -57,14 +57,21 @@ export async function generateAnswers(id, providers, options = {}) {
   }
   const unknown = providers.filter((provider) => !PROVIDERS.includes(provider));
   if (unknown.length || providers.length === 0) throw new Error('AIは claude / codex / both から選んでください。');
-  const aiQuestions = task.questions.filter((question) => AI_KINDS.includes(question.kind) && question.supported);
+  // `only` (retry): the other questions keep what answer.json already has.
+  const only = options.only?.length ? options.only.map(Number) : null;
+  const targets = only ? task.questions.filter((question) => only.includes(question.number)) : task.questions;
+  const aiQuestions = targets.filter((question) => AI_KINDS.includes(question.kind) && question.supported);
   // File submissions are answered with a document the solvers write and `renderReports` turns into a PDF.
-  const reportQuestions = task.questions.filter((question) => isReportQuestion(question));
+  const reportQuestions = targets.filter((question) => isReportQuestion(question));
   if (aiQuestions.length + reportQuestions.length === 0) {
     throw new Error('AIが解答できる設問がありません。answer.json に自分で記入してください。');
   }
 
-  const prompt = `${INSTRUCTIONS}\n\n以下が questions.md の内容です。\n\n${await readText(id, 'questions.md')}`;
+  const prompt = [
+    INSTRUCTIONS,
+    options.guidance,
+    `以下が questions.md の内容です。\n\n${await readText(id, 'questions.md')}`,
+  ].filter(Boolean).join('\n\n');
   await saveText(id, 'prompt.md', prompt);
 
   const results = await Promise.all(providers.map(async (provider) => {
@@ -93,9 +100,17 @@ export async function generateAnswers(id, providers, options = {}) {
   if (succeeded.length === 0) {
     throw new Error(results.map((result) => `${result.provider}: ${result.error}`).join('\n'));
   }
-  const existing = await readJson(id, 'answer.json').then((value) => value.answers).catch(() => []);
-  const draft = mergeAnswers(task.questions, succeeded, options.prefer, existing);
-  await renderReports(id, task, draft, succeeded, options.prefer ?? 'claude');
+  const previousDraft = await readJson(id, 'answer.json').catch(() => null);
+  const existing = previousDraft?.answers ?? [];
+  let draft = mergeAnswers(targets, succeeded, options.prefer, existing);
+  if (only) {
+    const kept = existing.filter((answer) => !only.includes(Number(answer.question)));
+    draft = {
+      ...draft,
+      answers: [...kept, ...draft.answers].sort((left, right) => Number(left.question) - Number(right.question)),
+    };
+  }
+  await renderReports(id, task, draft, succeeded, options.prefer ?? 'claude', only);
   await saveJson(id, 'answer.json', draft);
   await updateTask(id, { status: 'answered', approval: null });
   return { results, draft };

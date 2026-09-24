@@ -11,6 +11,7 @@ import { describeValues, validateAnswers } from './task-questions.js';
 import { reportFiles } from './task-report.js';
 import { FINISHED_STATUSES, TASK_ROOT, readJson, readTask, readText, saveJson, saveText, taskDir, taskPath, updateTask } from './task-store.js';
 import { approveTask, reviewTask } from './task-submit.js';
+import { parseGradeResults } from './task-retry.js';
 
 // Local web UI for the assignment workflow: the same steps as `npm run task`, but with the
 // questions, the materials and both AIs' answers on one screen so answers can be checked and
@@ -76,6 +77,11 @@ export function commandArgs(action, params = {}) {
       return ['select', id(), params.provider, ...numbers()];
     case 'render':
       return ['render', id(), ...numbers()];
+    case 'retry': {
+      const which = params.provider ?? 'both';
+      if (!['both', ...PROVIDERS].includes(which)) throw new Error('AIは claude / codex / both から選んでください。');
+      return ['retry', id(), which, ...numbers()];
+    }
     case 'dry-run':
       return ['dry-run', id(), ...attempt()];
     case 'submit':
@@ -191,7 +197,7 @@ async function buildDetail(id) {
     const answer = draft.answers?.find((item) => Number(item.question) === question.number);
     const entry = {
       ...question,
-      draft: answer ? { values: answer.values, source: answer.source ?? null, conflict: Boolean(answer.conflict) } : null,
+      draft: answer ? { values: answer.values, source: answer.source ?? null, conflict: Boolean(answer.conflict), repeated: Boolean(answer.repeated) } : null,
       describe: answer ? safeDescribe(question, answer.values) : null,
       solvers: {},
       report: null,
@@ -223,6 +229,9 @@ async function buildDetail(id) {
   }
 
   const files = await readdir(taskDir(id)).catch(() => []);
+  const receipt = files.includes('submission-receipt.txt')
+    ? (await readText(id, 'submission-receipt.txt').catch(() => '')).slice(0, 20000)
+    : null;
   return {
     task: { ...task, questions: undefined },
     questions,
@@ -231,9 +240,9 @@ async function buildDetail(id) {
     digest,
     reviewError,
     screenshots: files.filter((name) => /\.png$/.test(name)).sort(),
-    receipt: files.includes('submission-receipt.txt')
-      ? (await readText(id, 'submission-receipt.txt').catch(() => '')).slice(0, 20000)
-      : null,
+    receipt,
+    // The grade table of this submission, or of the previous one while a retry is being prepared.
+    grades: receipt ? parseGradeResults(receipt) : (task.attempts?.at(-1)?.results ?? []),
     solverErrors: Object.fromEntries(PROVIDERS.map((provider) => [provider, solvers[provider] ? null : 'まだ実行していません'])),
   };
 }
@@ -472,6 +481,7 @@ const JOB_LABELS = {
   fetch: '課題を取得',
   answer: 'AIが解答を作成',
   select: '解答を差し替え',
+  retry: '間違えた設問を解き直す',
   render: 'レポートPDFを作成',
   'dry-run': '入力だけ試す（提出しない）',
   submit: '提出',

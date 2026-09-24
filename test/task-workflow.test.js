@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, rm } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import AdmZip from 'adm-zip';
 import { extractAttachmentText } from '../src/task-extract.js';
 import { decodeChapterList, extractCourseContents, roundNumbers, selectContent } from '../src/task-fetch.js';
@@ -8,7 +10,8 @@ import { collectReports, generateAnswers, isReportQuestion, mergeAnswers, parseS
 import { markdownToHtml } from '../src/task-report.js';
 import { describeValues, parseQuestionForm, parseQuestionText, questionFingerprint, renderQuestions, validateAnswers } from '../src/task-questions.js';
 import { approveTask, reviewTask, submitTask, verifyUploaded } from '../src/task-submit.js';
-import { answerDigest, readJson, readTask, saveJson, saveTask, saveText, taskDir, taskPath } from '../src/task-store.js';
+import { answerDigest, readJson, readTask, readText, saveJson, saveTask, saveText, taskDir, taskPath } from '../src/task-store.js';
+import { parseGradeResults, retryTask } from '../src/task-retry.js';
 
 // Mirrors the markup of WebClass dqstn_answer_all.php.
 const FORM = `
@@ -314,4 +317,101 @@ test('an upload counts only when this upload changed the question, not an old �
   await assert.rejects(verifyUploaded(frame('ファイルを選択'), question, paths, ''), /確認できませんでした/);
   // Re-checking a page after this run's uploads only looks at the stored state.
   await verifyUploaded(frame('提出済 old.pdf'), question, paths);
+});
+
+const RECEIPT = [
+  '[https://webclass.nanzan-u.ac.jp/webclass/reslt_menu.php]',
+  'テスト名\t日\t得点\t得点率',
+  '問\t解答\t結果\t得点/配点\t解説\t出題分野\tコメント',
+  '1\ta\t○\t2/2\t\t',
+  '\t',
+  '2\t1\t×\t0/2\t\t',
+  '3\t2\t○\t1/1\t\t',
+  '成績を閉じる',
+].join('\n');
+
+test('the grade table of a submission is read from the receipt', () => {
+  assert.deepEqual(parseGradeResults(RECEIPT), [
+    { question: 1, answer: 'a', mark: '○', score: 2, max: 2 },
+    { question: 2, answer: '1', mark: '×', score: 0, max: 2 },
+    { question: 3, answer: '2', mark: '○', score: 1, max: 1 },
+  ]);
+  assert.deepEqual(parseGradeResults('お疲れさまでした。試験が終了しました。'), []);
+});
+
+test('retry answers only the questions marked wrong and keeps the rest of the submission', async () => {
+  const id = 'abcdef0123456783';
+  const questions = parseQuestionForm(FORM).slice(0, 3);
+  const answers = [{ question: 1, values: ['a'] }, { question: 2, values: ['1'] }, { question: 3, values: ['2'] }];
+  const solver = join(tmpdir(), `fake-claude-${process.pid}.js`);
+  // Answers every question; retry must take only question 2 from it.
+  await writeFile(solver, `process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({ result: JSON.stringify({
+    answers: [{ question: 1, values: ['zzz'], confidence: 'high', evidence: '' },
+      { question: 2, values: [process.env.FAKE_RETRY_VALUE], confidence: 'medium', evidence: '前回は甲を選んだ' }],
+    reports: [], notes: '' }) })));`);
+  const saved = { cli: process.env.CLAUDE_CLI_PATH, value: process.env.FAKE_RETRY_VALUE };
+  process.env.CLAUDE_CLI_PATH = solver;
+  const setup = async () => {
+    await rm(taskDir(id), { recursive: true, force: true });
+    await saveTask(id, { id, status: 'submitted', submittedAt: '2026-09-24T00:00:00Z', questions,
+      fingerprint: questionFingerprint(questions), approval: { digest: 'x' },
+      item: { courseName: '授業', title: '課題', deadlineAt: null } });
+    await saveText(id, 'questions.md', renderQuestions(questions));
+    await saveText(id, 'submission-receipt.txt', RECEIPT);
+    await saveText(id, 'after-submit.png', 'png');
+    await saveJson(id, 'answer.json', { providers: ['claude'], answers });
+    await saveJson(id, 'answer-codex.json', { provider: 'codex', answers, reports: [] });
+  };
+  try {
+    await setup();
+    process.env.FAKE_RETRY_VALUE = '2';
+    const result = await retryTask(id, { providers: ['claude'] });
+    assert.deepEqual(result.targets, [2]);
+    assert.deepEqual(result.repeated, []);
+    const draft = await readJson(id, 'answer.json');
+    assert.deepEqual(draft.answers.map((answer) => [answer.question, answer.values, answer.source]),
+      [[1, ['a'], 'correct'], [2, ['2'], 'claude'], [3, ['2'], 'correct']]);
+    const task = await readTask(id);
+    assert.equal(task.status, 'answered');
+    assert.equal(task.approval, null);
+    assert.equal(task.attempts[0].results.length, 3);
+    // The previous submission is kept aside, and the solver was told what was marked wrong.
+    assert.equal(await readText(id, 'attempts/1/submission-receipt.txt'), RECEIPT);
+    await assert.rejects(readText(id, 'submission-receipt.txt'));
+    // A solver that did not run this time no longer shows its old, wrong answer.
+    assert.deepEqual((await readJson(id, 'answer-codex.json')).answers.map((answer) => answer.question), [1, 3]);
+    assert.equal((await readJson(id, 'attempts/1/answer-codex.json')).answers.length, 3);
+    assert.match(await readText(id, 'prompt.md'), /設問2（× 0\/2点）\n前回の解答:\n {2}1\. 甲/);
+    assert.match((await reviewTask(id)).markdown, /\*\*前回の解答（× 0\/2点）\*\*/);
+
+    // Repeating the answer that was just marked wrong is flagged for the review.
+    await setup();
+    process.env.FAKE_RETRY_VALUE = '1';
+    const again = await retryTask(id, { providers: ['claude'] });
+    assert.deepEqual(again.repeated, [2]);
+    assert.match((await reviewTask(id)).markdown, /設問2 ⚠ 前回不正解だった解答と同じです/);
+
+    // Running retry again on the unsubmitted draft solves the same questions without archiving again.
+    process.env.FAKE_RETRY_VALUE = '2';
+    const resumed = await retryTask(id, { providers: ['claude'] });
+    assert.equal(resumed.resumed, true);
+    assert.deepEqual(resumed.repeated, []);
+    assert.equal((await readTask(id)).attempts.length, 1);
+    await assert.rejects(retryTask(id, { providers: ['claude'], questions: [3] }), /対象ではありません/);
+
+    // Only a submitted task can be retried, and without a grade table the questions must be named.
+    await saveTask(id, { ...(await readTask(id)), status: 'fetched', retry: undefined });
+    await assert.rejects(retryTask(id, { providers: ['claude'] }), /提出済みの課題だけ/);
+    await setup();
+    await saveText(id, 'submission-receipt.txt', '試験が終了しました。');
+    await assert.rejects(retryTask(id, { providers: ['claude'] }), /設問番号を指定/);
+    await assert.rejects(retryTask(id, { providers: ['claude'], questions: [9] }), /存在しない設問/);
+  } finally {
+    for (const [key, value] of [['CLAUDE_CLI_PATH', saved.cli], ['FAKE_RETRY_VALUE', saved.value]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(solver, { force: true });
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
 });

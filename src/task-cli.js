@@ -2,6 +2,7 @@ import { loadTaskConfig } from './config.js';
 import { formatDeadline, isMaterial, fetchTask, listContents } from './task-fetch.js';
 import { generateAnswers, isReportQuestion, PROVIDERS, renderReport, selectProvider } from './task-answer.js';
 import { approveTask, reviewTask, submitTask } from './task-submit.js';
+import { retryTask } from './task-retry.js';
 import { readTask, taskDir, taskId } from './task-store.js';
 
 const USAGE = `WebClass課題ワークフロー
@@ -15,6 +16,7 @@ const USAGE = `WebClass課題ワークフロー
   npm run task -- dry-run <task-id>                 入力して画面を保存（採点は押さない）
   npm run task -- approve <task-id> <承認用ハッシュ>
   npm run task -- submit <task-id>                  承認済みの解答を提出（採点ボタンを押す）
+  npm run task -- retry <task-id> [claude|codex|both] [設問番号...]  提出後に間違えた設問だけ解き直す
   npm run task -- status <task-id>`;
 
 const [command, ...rawArgs] = process.argv.slice(2);
@@ -127,6 +129,30 @@ async function main() {
       console.log(result.verified
         ? `提出しました。結果: ${result.receipt}`
         : `採点ボタンは押しましたが、結果画面を確認できませんでした。再実行せず ${result.receipt} と ${result.screenshot} を確認してください。`);
+      break;
+    }
+    case 'retry': {
+      const [id, ...rest] = positional;
+      const which = ['both', ...PROVIDERS].includes(rest[0]) ? rest.shift() : 'both';
+      const { attempt, targets, previous, results, repeated, resumed } = await retryTask(id, {
+        providers: which === 'both' ? PROVIDERS : [which],
+        questions: rest,
+        prefer: optionValues['--prefer']?.[0],
+      });
+      console.log(resumed
+        ? `${attempt}回目の提出に向けた解き直しを、もう一度AIに解かせました。`
+        : `前回の提出記録を attempts/${attempt - 1}/ に移し、${attempt}回目の提出の解答案を作りました。`);
+      for (const item of previous) {
+        const grade = item.grade ? `${item.grade.mark} ${item.grade.score}/${item.grade.max}点` : '指定';
+        console.log(`設問${item.question}（前回 ${grade}）: ${item.describe.replace(/\n/g, ' / ')}`);
+      }
+      for (const result of results) {
+        console.log(result.error
+          ? `✗ ${result.provider}: ${result.error}`
+          : `✓ ${result.provider} (${result.model} / effort ${result.effort}): 設問${targets.join(', ')}を解き直しました`);
+      }
+      if (repeated.length) console.log(`⚠ 前回不正解と同じ解答になった設問: ${repeated.join(', ')}（review で確認してください）`);
+      console.log(`正解だった設問は前回の解答のままです。次: npm run task -- review ${id}`);
       break;
     }
     case 'status': {

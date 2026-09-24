@@ -30,6 +30,8 @@ export async function reviewTask(id) {
     `- 使用したAI: ${draft.providers?.join(', ') || '手動'}`,
     `- AIの案が一致しなかった設問（レポートは本文を読み比べてください）: ${conflicts.length ? conflicts.map((number) => `設問${number}`).join(', ') : 'なし'}`,
     `- 承認用ハッシュ: \`${digest.slice(0, 16)}\``,
+    ...(task.retry ? [`- 再提出（${task.retry.attempt}回目）: 解き直した設問 ${task.retry.questions.map((item) => `設問${item.question}`).join(', ')}。`
+      + 'それ以外は前回の解答のままです（前回の提出記録は attempts/ にあります）'] : []),
     '',
     '一致していても正解とは限りません。資料と照らして確認してください。',
     '',
@@ -37,8 +39,15 @@ export async function reviewTask(id) {
   for (const question of task.questions) {
     const answer = answers.find((item) => item.question === question.number);
     const meta = draft.answers.find((item) => item.question === question.number);
-    lines.push(`## 設問${question.number}${meta?.conflict ? ' ⚠ AIの案が一致していません' : ''}`, '', question.text, '');
+    lines.push(`## 設問${question.number}${conflictLabel(meta)}`, '', question.text, '');
     lines.push('**提出する解答**', '', indent(describeValues(question, answer.values)), '');
+    const retried = task.retry?.questions.find((item) => item.question === question.number);
+    if (retried) {
+      const grade = retried.grade ? `${retried.grade.mark} ${retried.grade.score}/${retried.grade.max}点` : '本人が誤りと判断';
+      lines.push(`**前回の解答（${grade}）**`, '', indent(describeValues(question, retried.values)), '');
+    } else if (meta?.source === 'correct') {
+      lines.push('（前回の提出で正解だった解答です）', '');
+    }
     if (isReportQuestion(question)) {
       const body = await readText(id, reportFiles(question.number).markdown).catch(() => '');
       if (body.trim()) {
@@ -63,6 +72,12 @@ export async function reviewTask(id) {
   const markdown = lines.join('\n');
   await saveText(id, 'review.md', markdown);
   return { task, draft, answers, digest, conflicts, markdown, path: taskPath(id, 'review.md') };
+}
+
+export function conflictLabel(meta) {
+  if (meta?.repeated) return ' ⚠ 前回不正解だった解答と同じです';
+  if (meta?.source === 'wrong') return ' ⚠ 前回不正解のまま（解き直しが終わっていません）';
+  return meta?.conflict ? ' ⚠ AIの案が一致していません' : '';
 }
 
 export async function approveTask(id, digestPrefix) {

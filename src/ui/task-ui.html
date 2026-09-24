@@ -63,6 +63,8 @@
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 14px 16px; margin-bottom: 14px; }
   .card.dirty { border-color: var(--warn); }
   .card.conflict { border-left: 3px solid var(--warn); }
+  .grades { border-collapse: collapse; margin: 4px 0 10px; }
+  .grades th, .grades td { border-bottom: 1px solid var(--line); padding: 4px 12px 4px 0; text-align: left; }
   .card h3 { margin: 0 0 8px; font-size: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .qtext { white-space: pre-wrap; background: var(--panel2); border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; }
   .tabs { display: flex; gap: 6px; margin: 14px 0; flex-wrap: wrap; }
@@ -381,10 +383,18 @@ function questionCard(question) {
     question.points ? pill(`配点 ${question.points}`) : null,
     question.page ? pill(`ページ${question.page}`) : null,
     source ? pill(sourceLabel(source), source === 'agreed' ? 'good' : source === 'user' ? 'accent' : '') : null,
-    question.draft?.conflict ? pill(question.report ? 'AIの本文を読み比べる' : 'AIの案が一致していない', 'warn') : null,
+    question.draft?.conflict ? pill(conflictText(question), 'warn') : null,
     !question.supported ? pill('自動入力に未対応', 'bad') : null,
   ]));
   card.append(el('pre', { className: 'qtext', textContent: question.text || '（問題文なし）' }));
+  const retried = detail.task.retry?.questions?.find((item) => item.question === question.number);
+  if (retried) {
+    const grade = retried.grade ? `${retried.grade.mark} ${retried.grade.score}/${retried.grade.max}点` : '本人が誤りと判断';
+    card.append(el('div', { className: 'solver', style: 'margin-bottom:12px;border-color:var(--bad)' }, [
+      el('div', { className: 'small', style: 'color:var(--bad)', textContent: `前回の解答（${grade}）` }),
+      el('pre', { className: 'plain', textContent: retried.describe ?? retried.values.join(' / ') }),
+    ]));
+  }
 
   if (question.report) {
     const jump = el('button', { textContent: 'レポート本文を見る・直す' });
@@ -406,7 +416,13 @@ function questionCard(question) {
 }
 
 function sourceLabel(source) {
-  return { agreed: '両AI一致', user: '自分で編集', none: '未解答' }[source] ?? source;
+  return { agreed: '両AI一致', user: '自分で編集', none: '未解答', correct: '前回正解', wrong: '前回不正解' }[source] ?? source;
+}
+
+function conflictText(question) {
+  if (question.draft?.repeated) return '前回不正解と同じ解答';
+  if (question.draft?.source === 'wrong') return '解き直しが終わっていない';
+  return question.report ? 'AIの本文を読み比べる' : 'AIの案が一致していない';
 }
 
 function solverBox(question, name, result) {
@@ -653,6 +669,7 @@ function viewSubmit() {
     el('div', { className: 'bar', style: 'margin-top:8px' }, [dry, approve, submit]),
   ]));
 
+  if (detail.grades?.length || task.retry || ['submitted', 'unverified'].includes(task.status)) box.append(gradesCard());
   if (detail.screenshots.length) {
     box.append(el('div', { className: 'card' }, [
       el('h3', {}, [el('span', { textContent: 'WebClassの画面' })]),
@@ -669,6 +686,62 @@ function viewSubmit() {
     ]));
   }
   return box;
+}
+
+// Grades read from WebClass's result table, and the retry of the questions that lost points.
+function gradesCard() {
+  const { task } = detail;
+  const grades = detail.grades ?? [];
+  const current = ['submitted', 'unverified'].includes(task.status);
+  const card = el('div', { className: 'card' }, [
+    el('h3', {}, [el('span', { textContent: current ? '採点結果' : `前回（${task.attempts?.length ?? ''}回目）の採点結果` })]),
+  ]);
+  if (grades.length) {
+    const total = grades.reduce((sum, item) => sum + item.score, 0);
+    const max = grades.reduce((sum, item) => sum + item.max, 0);
+    card.append(el('table', { className: 'grades small' }, [
+      el('tr', {}, ['設問', '結果', '得点', 'WebClassに表示された解答'].map((text) => el('th', { textContent: text }))),
+      ...grades.map((item) => el('tr', {}, [
+        el('td', { textContent: `設問${item.question}` }),
+        el('td', {}, [pill(item.mark || '-', item.score >= item.max ? 'good' : 'bad')]),
+        el('td', { textContent: `${item.score}/${item.max}` }),
+        el('td', { className: 'dim', textContent: item.answer }),
+      ])),
+      el('tr', {}, [el('td', { textContent: '合計' }), el('td'), el('td', { textContent: `${total}/${max}` }), el('td')]),
+    ]));
+  } else {
+    card.append(el('p', { className: 'small dim', textContent: '提出結果に採点表が見つかりませんでした。解き直す設問を番号で指定してください。' }));
+  }
+  // While the retry is still a draft, its solvers can be run again on the same questions.
+  const resumable = Boolean(task.retry) && ['answered', 'approved', 'fetched'].includes(task.status);
+  if (!current && !resumable) return card;
+
+  const wrong = resumable
+    ? task.retry.questions.map((item) => item.question)
+    : grades.filter((item) => item.score < item.max).map((item) => item.question);
+  const numbers = el('input', { type: 'text', value: wrong.join(' '), placeholder: '例: 2 4', style: 'width:140px' });
+  const provider = el('select', { style: 'width:auto' }, [
+    el('option', { value: 'both', textContent: '両方のAI' }),
+    ...state.providers.map((name) => el('option', { value: name, textContent: `${name} だけ` })),
+  ]);
+  const retry = el('button', { className: 'primary', textContent: resumable ? 'もう一度AIに解き直させる' : '間違えた設問を解き直す' });
+  retry.onclick = () => {
+    const questions = numbers.value.split(/[\s,、]+/).filter(Boolean);
+    if (!questions.length) return toast('解き直す設問の番号を入れてください。', true);
+    modal({
+      title: '間違えた設問を解き直しますか',
+      lead: `設問${questions.join(', ')} だけをAIに解き直させます。ほかの設問は前回の解答のままです。`,
+      body: [el('ul', {}, [
+        resumable ? null : el('li', { textContent: '前回の提出記録（結果・スクリーンショット・解答）は attempts/ フォルダに移します。' }),
+        el('li', { textContent: 'AIには前回の解答が不正解だったことを伝えます。' }),
+        el('li', { textContent: '提出はしません。いつもどおり確認 → 承認 → 提出の順です。' }),
+      ])],
+      label: '解き直す',
+      action: async () => run('retry', { id: selected, provider: provider.value, questions }),
+    });
+  };
+  card.append(el('div', { className: 'bar' }, [el('span', { className: 'small dim', textContent: '解き直す設問:' }), numbers, provider, retry]));
+  return card;
 }
 
 function confirmApprove() {

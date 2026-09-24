@@ -44,6 +44,8 @@ test('the UI can only build the assignment commands, never extra flags', () => {
     ['answer', ID, 'claude', '--prefer', 'codex']);
   assert.deepEqual(commandArgs('select', { id: ID, provider: 'codex', questions: ['3', 7] }), ['select', ID, 'codex', '3', '7']);
   assert.deepEqual(commandArgs('submit', { id: ID }), ['submit', ID]);
+  assert.deepEqual(commandArgs('retry', { id: ID, questions: [4] }), ['retry', ID, 'both', '4']);
+  assert.throws(() => commandArgs('retry', { id: ID, questions: ['--force'] }), /設問番号/);
 
   // A value from the browser must never become an option of its own.
   assert.throws(() => commandArgs('fetch', { query: '課題 --allow-attempt' }), /- から始まる/);
