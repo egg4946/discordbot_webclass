@@ -112,7 +112,34 @@ export async function fetchAssignmentSnapshot(config, options = {}) {
   }
 }
 
-async function gotoWebclassPage(page, url) {
+// Used by the assignment workflow (src/task-*.js). The notifier keeps its own
+// login sequence above so its failure handling stays unchanged.
+export async function openWebclassSession(config) {
+  const browser = await chromium.launch({ headless: config.headless });
+  try {
+    const page = await browser.newPage({ locale: 'ja-JP', timezoneId: 'Asia/Tokyo' });
+    await gotoWebclassPage(page, config.webclassLoginUrl);
+    if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
+      await fillFirstVisible(page, USERNAME_SELECTORS, config.webclassUserId);
+      await fillFirstVisible(page, PASSWORD_SELECTORS, config.webclassPassword);
+      await clickFirstVisible(page, SUBMIT_SELECTORS);
+      await page.waitForLoadState('domcontentloaded').catch(() => undefined);
+    }
+    if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
+      throw new Error('WebClass login did not complete.');
+    }
+    return { browser, page };
+  } catch (error) {
+    await browser.close();
+    throw error;
+  }
+}
+
+export async function isWebclassLoginPage(page) {
+  return hasFirstVisible(page, PASSWORD_SELECTORS);
+}
+
+export async function gotoWebclassPage(page, url) {
   await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
   await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => undefined);
   await page.waitForTimeout(1200);

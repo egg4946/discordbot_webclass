@@ -1,5 +1,7 @@
 # WebClass Discord Notifier
 
+課題の回答案作成と承認後提出は [TASK_WORKFLOW.md](TASK_WORKFLOW.md) を参照してください。ローカルの操作画面は `npm run task:ui`（または `task-ui.bat`）で開きます。
+
 南山大学WebClass専用のDiscord通知Botです。KAGOYA CLOUD VPS（Ubuntu 22.04）上で常時運用しています。
 
 ## 構成

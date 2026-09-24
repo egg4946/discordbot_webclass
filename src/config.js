@@ -52,6 +52,26 @@ export function loadConfig() {
   return config;
 }
 
+// The assignment CLI does not need Discord credentials.
+export function loadTaskConfig() {
+  const config = {
+    webclassLoginUrl: required('WEBCLASS_LOGIN_URL'),
+    webclassUserId: required('WEBCLASS_USER_ID'),
+    webclassPassword: required('WEBCLASS_PASSWORD'),
+    webclassTargetUrls: optionalList('WEBCLASS_TARGET_URLS'),
+    headless: (process.env.WEBCLASS_HEADLESS ?? 'true').toLowerCase() !== 'false',
+  };
+  assertNanzanWebclassUrl(config.webclassLoginUrl, 'WEBCLASS_LOGIN_URL');
+  for (const targetUrl of config.webclassTargetUrls) {
+    assertNanzanWebclassUrl(targetUrl, 'WEBCLASS_TARGET_URLS');
+  }
+  return config;
+}
+
+export function assertWebclassTaskUrl(value) {
+  assertNanzanWebclassUrl(value, 'task URL');
+}
+
 function assertNanzanWebclassUrl(value, name) {
   const url = new URL(value);
   if (url.hostname !== ALLOWED_WEBCLASS_HOST) {
