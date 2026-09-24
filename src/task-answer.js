@@ -252,8 +252,8 @@ export function parseSolverOutput(text) {
 // Pinned explicitly so a change in the CLIs' personal defaults never changes the solver.
 export function solverModel(provider) {
   const defaults = {
-    claude: { model: 'claude-opus-5', effort: 'medium' },
-    codex: { model: 'gpt-5.6-sol', effort: 'medium' },
+    claude: { model: 'claude-opus-5-5', effort: 'medium' },
+    codex: { model: 'gpt-6-sol', effort: 'medium' },
   }[provider];
   // TASK_ prefixed so a Claude Code / Codex session running these commands cannot
   // override them with its own CLAUDE_EFFORT, ANTHROPIC_MODEL and similar variables.

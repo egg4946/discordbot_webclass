@@ -102,8 +102,8 @@ AIは課題フォルダを読み取り専用で参照し、`questions.md`・`mat
 
 | AI | モデル | 推論の強さ |
 | --- | --- | --- |
-| Claude | `claude-opus-5` | `medium` |
-| Codex | `gpt-5.6-sol` | `medium` |
+| Claude | `claude-opus-5-5` | `medium` |
+| Codex | `gpt-6-sol` | `medium` |
 
 変更したい場合だけ `.env` に `TASK_CLAUDE_MODEL` / `TASK_CLAUDE_EFFORT` / `TASK_CODEX_MODEL` / `TASK_CODEX_EFFORT` を設定します。`review` には、各解答を作ったモデルが表示されます。CLIが標準以外の場所にある場合は `CLAUDE_CLI_PATH` / `CODEX_CLI_PATH` で指定できます。
 
