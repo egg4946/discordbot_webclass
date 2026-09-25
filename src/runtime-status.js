@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { writeJsonFile } from './json-file.js';
 
 const DEFAULT_STATUS = {
   lastAttemptAt: null,
@@ -24,8 +24,19 @@ export async function loadRuntimeStatus(path) {
 }
 
 export async function saveRuntimeStatus(path, status) {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify({ ...DEFAULT_STATUS, ...status }, null, 2)}\n`, 'utf8');
+  await writeJsonFile(path, { ...DEFAULT_STATUS, ...status });
+}
+
+export const FAILURE_NOTIFICATION_THRESHOLD = 3;
+
+// Notify once, exactly when the consecutive failures reach the threshold.
+export function shouldNotifyFailure(status) {
+  return status.consecutiveFailures === FAILURE_NOTIFICATION_THRESHOLD;
+}
+
+// A recovery notice pairs with a failure notice, so it is sent only if one was sent before.
+export function shouldNotifyRecovery(previousConsecutiveFailures) {
+  return (previousConsecutiveFailures ?? 0) >= FAILURE_NOTIFICATION_THRESHOLD;
 }
 
 export function markAttempt(status, now = new Date()) {

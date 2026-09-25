@@ -26,6 +26,13 @@ const SUBMIT_SELECTORS = [
 ];
 
 export async function fetchAssignments(config, options = {}) {
+  const { assignments } = await fetchAssignmentSnapshot(config, options);
+  return assignments;
+}
+
+// Returns the assignments together with the course pages that could not be read,
+// so callers can avoid treating a partial result as the complete list.
+export async function fetchAssignmentSnapshot(config, options = {}) {
   const browser = await chromium.launch({ headless: config.headless });
   const page = await browser.newPage({ locale: 'ja-JP', timezoneId: 'Asia/Tokyo' });
 
@@ -38,43 +45,101 @@ export async function fetchAssignments(config, options = {}) {
       await page.waitForLoadState('domcontentloaded').catch(() => undefined);
     }
 
-    const targetUrls = config.webclassTargetUrls.length
-      ? config.webclassTargetUrls
+    // Pages are reported even when they cannot be read, so `npm run inspect:webclass`
+    // still saves the HTML needed to diagnose login or layout changes.
+    const reportPage = async (html, assignmentCount) => {
+      if (options.onPage) {
+        await options.onPage({
+          url: page.url(),
+          title: await page.title(),
+          assignmentCount,
+        });
+      }
+      if (options.saveDebugHtml) {
+        await options.saveDebugHtml(html, page.url());
+      }
+    };
+
+    const discovery = config.webclassTargetUrls.length
+      ? { urls: config.webclassTargetUrls, failedUrls: [] }
       : await discoverCourseUrls(page);
+    const targetUrls = discovery.urls;
+
+    if (targetUrls.length === 0) {
+      await reportPage(await page.content(), 0);
+      throw new Error('No WebClass course pages were found. The login may have failed.');
+    }
 
     const assignments = [];
+    const failedUrls = [];
     for (const targetUrl of targetUrls) {
       try {
         await gotoWebclassPage(page, targetUrl);
       } catch (error) {
         console.warn(`Skipped WebClass page after navigation failure: ${targetUrl}`);
         console.warn(error.message);
+        failedUrls.push(targetUrl);
         continue;
       }
+
       const html = await page.content();
+      const unreadableReason = (await hasFirstVisible(page, PASSWORD_SELECTORS))
+        ? 'the session was lost'
+        : unreadablePageReason(html);
+      if (unreadableReason) {
+        console.warn(`Skipped WebClass page because ${unreadableReason}: ${targetUrl}`);
+        failedUrls.push(targetUrl);
+        await reportPage(html, 0);
+        continue;
+      }
+
       const pageAssignments = extractAssignments(html, page.url());
       assignments.push(...pageAssignments);
-
-      if (options.onPage) {
-        await options.onPage({
-          url: page.url(),
-          title: await page.title(),
-          assignmentCount: pageAssignments.length,
-        });
-      }
-
-      if (options.saveDebugHtml) {
-        await options.saveDebugHtml(html, page.url());
-      }
+      await reportPage(html, pageAssignments.length);
     }
 
-    return dedupeAssignments(assignments);
+    if (failedUrls.length === targetUrls.length) {
+      throw new Error(`Could not read any of the ${targetUrls.length} WebClass course pages.`);
+    }
+
+    return {
+      assignments: dedupeAssignments(assignments),
+      // A failed course discovery may have hidden courses, so it counts as a partial failure.
+      failedUrls: [...discovery.failedUrls, ...failedUrls],
+    };
   } finally {
     await browser.close();
   }
 }
 
-async function gotoWebclassPage(page, url) {
+// Used by the assignment workflow (src/task-*.js). The notifier keeps its own
+// login sequence above so its failure handling stays unchanged.
+export async function openWebclassSession(config) {
+  const browser = await chromium.launch({ headless: config.headless });
+  try {
+    const page = await browser.newPage({ locale: 'ja-JP', timezoneId: 'Asia/Tokyo' });
+    await gotoWebclassPage(page, config.webclassLoginUrl);
+    if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
+      await fillFirstVisible(page, USERNAME_SELECTORS, config.webclassUserId);
+      await fillFirstVisible(page, PASSWORD_SELECTORS, config.webclassPassword);
+      await clickFirstVisible(page, SUBMIT_SELECTORS);
+      await page.waitForLoadState('domcontentloaded').catch(() => undefined);
+    }
+    if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
+      throw new Error('WebClass login did not complete.');
+    }
+    return { browser, page };
+  } catch (error) {
+    await browser.close();
+    throw error;
+  }
+}
+
+export async function isWebclassLoginPage(page) {
+  return hasFirstVisible(page, PASSWORD_SELECTORS);
+}
+
+export async function gotoWebclassPage(page, url) {
   await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
   await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => undefined);
   await page.waitForTimeout(1200);
@@ -141,23 +206,41 @@ async function discoverTargetUrls(page) {
   });
 
   const currentCourseUrl = isCourseTopUrl(currentUrl) ? [currentUrl] : [];
-  return [...currentCourseUrl, ...urls]
-    .filter((url, index, all) => all.indexOf(url) === index)
-    .slice(0, 80);
+  return dedupeCourseUrls([...currentCourseUrl, ...urls]).slice(0, 80);
 }
 
 async function discoverCourseUrls(page) {
   const urls = new Set(await discoverTargetUrls(page));
   const courseListUrl = new URL('/webclass/', page.url()).toString();
+  let listFailure = null;
 
-  await gotoWebclassPage(page, courseListUrl).catch((error) => {
-    console.warn(`Could not open course list: ${error.message}`);
-  });
-  for (const url of await discoverTargetUrls(page)) {
-    urls.add(url);
+  try {
+    await gotoWebclassPage(page, courseListUrl);
+    if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
+      listFailure = 'the session was lost';
+    }
+  } catch (error) {
+    listFailure = error.message;
   }
 
-  return Array.from(urls);
+  if (!listFailure) {
+    const listedUrls = await discoverTargetUrls(page);
+    if (listedUrls.length === 0) {
+      listFailure = 'no course links were found';
+    }
+    for (const url of listedUrls) {
+      urls.add(url);
+    }
+  }
+
+  if (listFailure) {
+    console.warn(`Could not read the course list (${listFailure}). Some courses may be missing.`);
+  }
+
+  return {
+    urls: dedupeCourseUrls(Array.from(urls)),
+    failedUrls: listFailure ? [courseListUrl] : [],
+  };
 }
 
 function isCourseTopUrl(value) {
@@ -165,11 +248,53 @@ function isCourseTopUrl(value) {
   return /^\/webclass\/course\.php\/[^/]+\/(?:login)?$/.test(url.pathname);
 }
 
-export function extractAssignments(html, pageUrl) {
-  const $ = cheerio.load(html);
-  const courseName = cleanCourseName(normalizeText(
+function dedupeCourseUrls(values) {
+  const selected = new Map();
+
+  for (const value of values) {
+    const url = new URL(value);
+    const courseId = url.pathname.match(/^\/webclass\/course\.php\/([^/]+)/)?.[1];
+    const key = courseId ? `${url.origin}|${courseId}` : value;
+    const existing = selected.get(key);
+    const isLoginEntry = /\/login\/?$/.test(url.pathname);
+
+    if (!existing || isLoginEntry) {
+      url.hash = '';
+      selected.set(key, url.toString());
+    }
+  }
+
+  return Array.from(selected.values());
+}
+
+// Returns why a loaded page is not a readable course page, or null if it is one.
+// An error or maintenance page yields no assignments, and treating that as a
+// successful read would drop the course's assignments from the saved state.
+export function unreadablePageReason(html) {
+  const courseName = extractCourseName(cheerio.load(html));
+  if (!courseName) {
+    return 'no course name was found';
+  }
+  // Only phrases typical of error pages, so courses such as "エラー訂正符号" stay readable.
+  if (
+    /(システムエラー|エラーが発生|メンテナンス中|Internal Server Error|Service Unavailable|under maintenance)/i.test(
+      courseName,
+    )
+  ) {
+    return `it looks like an error page (${courseName})`;
+  }
+  return null;
+}
+
+function extractCourseName($) {
+  return cleanCourseName(normalizeText(
     $('.course-name, h1, h2, .course-title, #course-title, .coursename').first().text(),
   ));
+}
+
+export function extractAssignments(html, pageUrl, now = new Date()) {
+  const $ = cheerio.load(html);
+  const courseName = extractCourseName($);
   $('script, style, nav, header, footer, noscript, .modal, .dropdown-menu').remove();
   const candidates = [];
   const candidateElements = collectCandidateElements($);
@@ -182,11 +307,11 @@ export function extractAssignments(html, pageUrl) {
 
     const href = $(element).find('a[href]').first().attr('href');
     const url = href ? new URL(href, pageUrl).toString() : pageUrl;
-    const title = pickTitle($, element, text);
+    const title = pickTitle($, element);
     const deadlineText = pickDeadline($, element, text);
-    const deadlineAt = pickDeadlineAt($, element, deadlineText);
+    const deadlineAt = pickDeadlineAt($, element, deadlineText, now);
     const status = pickStatus($, element, text);
-    if (!courseName || !deadlineText || isBadAssignmentTitle(title) || isExpired(deadlineAt)) {
+    if (!courseName || !deadlineText || isBadAssignmentTitle(title) || isExpired(deadlineAt, now)) {
       continue;
     }
 
@@ -196,6 +321,7 @@ export function extractAssignments(html, pageUrl) {
     candidates.push({
       id,
       stableKey,
+      sourceId: pickSourceId(url),
       courseName,
       title,
       deadlineText,
@@ -206,7 +332,7 @@ export function extractAssignments(html, pageUrl) {
     });
   }
 
-  return candidates;
+  return dedupeAssignments(candidates);
 }
 
 function collectCandidateElements($) {
@@ -255,17 +381,20 @@ function canonicalCandidateElement($, element) {
 }
 
 function dedupeAssignments(assignments) {
-  const seen = new Set();
-  return assignments.filter((assignment) => {
-    const key = `${normalizeCourseName(assignment.courseName)}|${normalizeTitle(
-      assignment.title,
-    )}|${assignment.deadlineText ?? ''}`;
-    if (seen.has(key)) {
-      return false;
+  const unique = new Map();
+
+  for (const assignment of assignments) {
+    // Different contents can share a title, so prefer the WebClass content ID.
+    const key = assignment.sourceId
+      ? `source:${assignment.sourceId}`
+      : `key:${assignment.stableKey}|${assignment.deadlineText ?? ''}`;
+    const existing = unique.get(key);
+    if (!existing || deadlineTime(assignment) < deadlineTime(existing)) {
+      unique.set(key, assignment);
     }
-    seen.add(key);
-    return true;
-  });
+  }
+
+  return Array.from(unique.values());
 }
 
 function normalizeText(value) {
@@ -281,7 +410,7 @@ function isProbableAssignmentElement($, element, text) {
   }
 
   const className = normalizeText($(element).attr('class') ?? '');
-  const title = pickTitle($, element, text);
+  const title = pickTitle($, element);
   if (isBadAssignmentTitle(title)) {
     return false;
   }
@@ -293,25 +422,31 @@ function isProbableAssignmentElement($, element, text) {
   }
 
   const knownTaskKind =
-    /^(レポート|自習|試験|テスト|小テスト)$/.test(category) ||
-    /content-kind-(report|examine|selfstudy)/i.test(className);
+    /^(レポート|試験|テスト|小テスト)$/.test(category) ||
+    /content-kind-(report|examine)/i.test(className);
+  const selfStudyKind =
+    category === '自習' || /content-kind-selfstudy/i.test(className);
   const taskGroup = /(課題|テスト)/.test(findGroupContext($, element));
   const hasDeadline = Boolean(pickDeadline($, element, text));
   const hasUsefulTitle = title.length >= 2 && !isNavigationOrUiText(title);
+  const hasExplicitTaskTitle = /(課題|レポート|小テスト|テスト|試験)/.test(title);
 
   const fallbackTaskEvidence =
     !category && taskGroup && /(レポート|自習|課題|小テスト|テスト|試験)/.test(evidenceText);
-  return hasUsefulTitle && hasDeadline && (knownTaskKind || fallbackTaskEvidence);
+  const requiredSelfStudy = selfStudyKind && hasExplicitTaskTitle;
+  return hasUsefulTitle && hasDeadline && (knownTaskKind || requiredSelfStudy || fallbackTaskEvidence);
 }
 
 function isBadAssignmentTitle(title) {
   const normalized = normalizeText(title);
   return (
     !normalized ||
-    /^(詳細|表示|開始|回答|実行|教材|資料|閲覧|開く|Top|もっと見る|さらに過去の記録を取得)$/i.test(
+    /^(New|新着|詳細|表示|開始|回答|実行|教材|資料|閲覧|開く|Top|もっと見る|さらに過去の記録を取得)$/i.test(
       normalized,
     ) ||
-    /^(詳細|表示|開始|回答|実行)$/.test(normalized)
+    /^(詳細|表示|開始|回答|実行)$/.test(normalized) ||
+    // Date-only cells (e.g. a deadline column) are never titles.
+    /^[\d\s\/\-.:：年月日～〜]+$/.test(normalized)
   );
 }
 
@@ -334,8 +469,8 @@ function findGroupContext($, element) {
   return normalizeText(`${previousHeadings} ${parentText}`);
 }
 
-function pickTitle($, element, fallbackText) {
-  const dataContentsName = normalizeText($(element).attr('data-contents-name') ?? '');
+function pickTitle($, element) {
+  const dataContentsName = cleanTitleCandidate($(element).attr('data-contents-name') ?? '');
   if (dataContentsName && !isBadAssignmentTitle(dataContentsName)) {
     return dataContentsName.slice(0, 120);
   }
@@ -351,20 +486,33 @@ function pickTitle($, element, fallbackText) {
     '.list-group-item-heading a',
     '.list-group-item-heading',
     'a[href*="do_contents"]',
+    'a[href]',
     'th',
     'td',
-    'span',
     'strong',
   ];
 
   for (const selector of titleSelectors) {
-    const title = normalizeText($(element).find(selector).first().text());
-    if (title && !isBadAssignmentTitle(title)) {
-      return title.slice(0, 120);
+    for (const candidate of $(element).find(selector).toArray()) {
+      const title = cleanTitleCandidate($(candidate).text());
+      if (title && !isBadAssignmentTitle(title)) {
+        return title.slice(0, 120);
+      }
     }
   }
 
-  return fallbackText.slice(0, 120);
+  return '';
+}
+
+function cleanTitleCandidate(value) {
+  return stripNewBadge(normalizeText(value))
+    .replace(/\s+(?:レポート|自習|試験|テスト|小テスト)利用(?:可能)?期間.*$/, '')
+    .trim();
+}
+
+// Strip only a standalone badge so titles such as "Newton法" stay intact.
+function stripNewBadge(value) {
+  return value.replace(/^(?:New(?![A-Za-z0-9])|新着)\s*/i, '');
 }
 
 function pickDeadline($, element, text) {
@@ -390,15 +538,15 @@ function pickDeadline($, element, text) {
   return null;
 }
 
-function pickDeadlineAt($, element, deadlineText) {
+function pickDeadlineAt($, element, deadlineText, now) {
   const endDate = Number($(element).attr('data-end-date'));
   if (Number.isFinite(endDate) && endDate > 0) {
     return new Date(endDate * 1000).toISOString();
   }
-  return parseDeadline(deadlineText);
+  return parseDeadline(deadlineText, now);
 }
 
-function parseDeadline(value) {
+function parseDeadline(value, now = new Date()) {
   if (!value) {
     return null;
   }
@@ -418,10 +566,25 @@ function parseDeadline(value) {
 
   const partial = normalized.match(/^(\d{1,2})\/\s*(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/);
   if (partial) {
-    return toLocalIso(new Date().getFullYear(), partial[1], partial[2], partial[3], partial[4]);
+    return closestYearIso(now, partial[1], partial[2], partial[3], partial[4]);
   }
 
   return null;
+}
+
+// A date without a year belongs to whichever of last/this/next year is closest to now,
+// so "1/10" read in December is next January and "12/25" read in January is last December.
+function closestYearIso(now, month, day, hour, minute) {
+  const year = now.getFullYear();
+  const candidates = [year - 1, year, year + 1]
+    .map((candidateYear) => toLocalIso(candidateYear, month, day, hour, minute))
+    .filter(Boolean);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const distance = (iso) => Math.abs(new Date(iso).getTime() - now.getTime());
+  return candidates.reduce((best, iso) => (distance(iso) < distance(best) ? iso : best));
 }
 
 function toLocalIso(year, month, day, hour = '23', minute = '59') {
@@ -444,12 +607,12 @@ function formatLocalDeadline(date) {
   return `${year}/${month}/${day} ${hour}:${minute}`;
 }
 
-function isExpired(deadlineAt) {
+function isExpired(deadlineAt, now) {
   if (!deadlineAt) {
     return true;
   }
   const deadline = new Date(deadlineAt);
-  return Number.isNaN(deadline.getTime()) || deadline.getTime() < Date.now();
+  return Number.isNaN(deadline.getTime()) || deadline.getTime() < now.getTime();
 }
 
 function pickStatus($, element, text) {
@@ -483,9 +646,27 @@ function cleanCourseName(value) {
 }
 
 function normalizeTitle(value) {
-  return normalizeText(value)
+  return stripNewBadge(normalizeText(value.normalize('NFKC')))
     .replace(/[ 　]/g, '')
     .replace(/[第１1]回/g, '第一回')
     .replace(/[第２2]回/g, '第二回')
     .replace(/[第３3]回/g, '第三回');
+}
+
+function pickSourceId(url) {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.searchParams.get('set_contents_id') ||
+      parsed.pathname.match(/\/contents\/([^/]+)/)?.[1] ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+function deadlineTime(assignment) {
+  const time = assignment.deadlineAt ? new Date(assignment.deadlineAt).getTime() : NaN;
+  return Number.isNaN(time) ? Number.POSITIVE_INFINITY : time;
 }

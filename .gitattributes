@@ -1,0 +1,5 @@
+# Files installed on the Linux VPS must keep LF line endings.
+deploy/** text eol=lf
+
+# Windows batch files must keep CRLF.
+*.bat text eol=crlf

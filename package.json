@@ -9,13 +9,17 @@
     "check": "node src/index.js",
     "inspect:webclass": "node src/inspect-webclass.js",
     "schedule:windows": "powershell -ExecutionPolicy Bypass -File ./scripts/register-scheduled-task.ps1",
-    "test": "node --test test/state.test.js test/reliability.test.js test/assignment-view.test.js test/command-access.test.js test/notification-routing.test.js",
-    "test:discord": "node src/test-discord.js"
+    "test": "node --test test/state.test.js test/reliability.test.js test/assignment-view.test.js test/command-access.test.js test/notification-routing.test.js test/webclass.test.js test/mutes.test.js test/task-workflow.test.js test/task-ui.test.js",
+    "test:discord": "node src/test-discord.js",
+    "task": "node src/task-cli.js",
+    "task:ui": "node src/task-ui.js"
   },
   "dependencies": {
+    "adm-zip": "^0.6.1",
     "cheerio": "^1.1.2",
     "discord.js": "^14.26.4",
     "dotenv": "^17.2.3",
+    "pdfjs-dist": "^4.10.38",
     "playwright": "^1.57.0"
   }
 }

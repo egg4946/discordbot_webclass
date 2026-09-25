@@ -1,0 +1,961 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebClass課題</title>
+<style>
+  :root {
+    --bg: #12151a; --panel: #1a1f27; --panel2: #212834; --line: #2e3744; --text: #e6eaf0;
+    --dim: #9aa7b8; --accent: #4f9cf9; --good: #3fbf7f; --warn: #e5a53f; --bad: #e5604f;
+    --shadow: 0 6px 24px rgba(0, 0, 0, .35);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6f9; --panel: #ffffff; --panel2: #eef1f6; --line: #d7dde6; --text: #1a1f27;
+      --dim: #5d6a7a; --shadow: 0 4px 16px rgba(20, 30, 50, .10);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.6;
+    font-family: "Segoe UI", "Yu Gothic UI", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+  }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  button {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 7px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+  input[type=text], input[type=search], textarea, select {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; width: 100%;
+  }
+  textarea { resize: vertical; min-height: 84px; font-family: Consolas, "Courier New", monospace; }
+  a { color: var(--accent); }
+
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 20;
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .04em; }
+  header .spacer { flex: 1; }
+  main { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 0; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  aside {
+    border-right: 1px solid var(--line); height: calc(100vh - 47px); overflow: auto;
+    position: sticky; top: 47px; padding: 10px;
+  }
+  .row {
+    display: block; width: 100%; text-align: left; background: none; border: 1px solid transparent;
+    border-radius: 9px; padding: 8px 10px; margin-bottom: 4px;
+  }
+  .row:hover { background: var(--panel); }
+  .row.on { background: var(--panel); border-color: var(--accent); }
+  .row .title { font-weight: 600; }
+  .row .meta { color: var(--dim); font-size: 12px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .group { color: var(--dim); font-size: 11px; letter-spacing: .1em; margin: 14px 4px 6px; }
+
+  section.detail { padding: 16px 20px 160px; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 14px 16px; margin-bottom: 14px; }
+  .card.dirty { border-color: var(--warn); }
+  .card.conflict { border-left: 3px solid var(--warn); }
+  .grades { border-collapse: collapse; margin: 4px 0 10px; }
+  .grades th, .grades td { border-bottom: 1px solid var(--line); padding: 4px 12px 4px 0; text-align: left; }
+  .card h3 { margin: 0 0 8px; font-size: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .qtext { white-space: pre-wrap; background: var(--panel2); border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; }
+  .tabs { display: flex; gap: 6px; margin: 14px 0; flex-wrap: wrap; }
+  .tabs button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+  .pill {
+    font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--dim); white-space: nowrap;
+  }
+  .pill.good { color: var(--good); border-color: var(--good); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .pill.bad { color: var(--bad); border-color: var(--bad); }
+  .pill.accent { color: var(--accent); border-color: var(--accent); }
+  .dim { color: var(--dim); }
+  .small { font-size: 12px; }
+  .solver { background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; }
+  .solver pre, .value pre { white-space: pre-wrap; margin: 4px 0; font-family: inherit; }
+  label.opt { display: flex; gap: 8px; align-items: flex-start; padding: 3px 0; cursor: pointer; }
+  label.opt input { margin-top: 6px; }
+  .part { margin-bottom: 8px; }
+  .parts { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 4px 10px; }
+  .part .lab { color: var(--dim); font-size: 12px; }
+  .savebar {
+    position: fixed; bottom: 46px; left: 50%; transform: translateX(-50%); z-index: 30;
+    background: var(--panel); border: 1px solid var(--warn); border-radius: 11px;
+    padding: 8px 12px; box-shadow: var(--shadow); display: none; gap: 10px; align-items: center;
+  }
+  .savebar.on { display: flex; }
+  #log {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; background: var(--panel);
+    border-top: 1px solid var(--line); box-shadow: var(--shadow);
+  }
+  #log .head { display: flex; gap: 10px; align-items: center; padding: 8px 14px; cursor: pointer; }
+  #log pre {
+    margin: 0; padding: 10px 14px; max-height: 38vh; overflow: auto; display: none;
+    font-family: Consolas, "Courier New", monospace; font-size: 12px; white-space: pre-wrap;
+    border-top: 1px solid var(--line);
+  }
+  #log.open pre { display: block; }
+  .spin { width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: sp .8s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
+  .shots a img, .pages img { width: 100%; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  .pages { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+  iframe.pdf { width: 100%; height: 70vh; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  pre.plain { white-space: pre-wrap; background: var(--panel2); border-radius: 8px; padding: 10px 12px; overflow: auto; max-height: 50vh; }
+  #veil {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, .55); z-index: 50;
+    display: none; align-items: center; justify-content: center; padding: 20px;
+  }
+  #veil.on { display: flex; }
+  #veil .box {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 13px; padding: 18px 20px;
+    max-width: 760px; width: 100%; max-height: 82vh; overflow: auto; box-shadow: var(--shadow);
+  }
+  .err { color: var(--bad); }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>WebClass課題</h1>
+  <button id="reload">一覧を更新</button>
+  <span id="listedAt" class="small dim"></span>
+  <span class="spacer"></span>
+  <span id="toast" class="small"></span>
+</header>
+
+<main>
+  <aside>
+    <input id="filter" type="search" placeholder="授業名・課題名でしぼりこむ">
+    <div id="list"></div>
+  </aside>
+  <section class="detail" id="detail"></section>
+</main>
+
+<div class="savebar" id="savebar">
+  <span id="saveCount"></span>
+  <button class="primary" id="save">保存する</button>
+  <button id="discard">取り消す</button>
+</div>
+
+<div id="log">
+  <div class="head" id="logHead">
+    <span id="logIcon"></span>
+    <strong id="logLabel">操作ログ</strong>
+    <span class="small dim" id="logMeta"></span>
+    <span class="spacer" style="flex:1"></span>
+    <button id="cancel" style="display:none">中止</button>
+    <span class="small dim" id="logToggle">▲</span>
+  </div>
+  <pre id="logBody"></pre>
+</div>
+
+<div id="veil"><div class="box" id="veilBox"></div></div>
+
+<script>
+const TOKEN = new URL(location.href).searchParams.get('t') || '';
+const STATUS = {
+  fetched: ['取得済', ''], answered: ['解答済', 'accent'], approved: ['承認済', 'warn'],
+  submitting: ['提出中', 'warn'], submitted: ['提出済', 'good'], unverified: ['要確認', 'bad'],
+  'fetch-error': ['取得失敗', 'bad'],
+};
+const KINDS = {
+  text: '記述欄', textarea: '記述式', checkbox: '複数選択', radio: '単一選択',
+  select: 'プルダウン', file: 'ファイル提出', unknown: '未対応',
+};
+let state = { tasks: [], contents: null, job: null, attemptCategories: [], providers: ['claude', 'codex'] };
+let detail = null;
+let selected = null;
+let tab = 'questions';
+let edits = new Map();
+let filter = '';
+
+const $ = (id) => document.getElementById(id);
+const el = (tagName, props = {}, children = []) => {
+  const node = Object.assign(document.createElement(tagName), props);
+  for (const child of [].concat(children)) if (child) node.append(child);
+  return node;
+};
+const pill = (text, kind = '') => el('span', { className: `pill ${kind}`, textContent: text });
+const fileUrl = (path) => `/api/task/${selected}/file?path=${encodeURIComponent(path)}&t=${TOKEN}`;
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { 'x-task-token': TOKEN, ...(options.body ? { 'content-type': 'application/json' } : {}) },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `${response.status} ${response.statusText}`);
+  return data;
+}
+
+function toast(message, bad = false) {
+  $('toast').textContent = message;
+  $('toast').className = `small ${bad ? 'err' : 'dim'}`;
+  if (message) setTimeout(() => { if ($('toast').textContent === message) $('toast').textContent = ''; }, 6000);
+}
+
+async function refreshState() {
+  state = await api('/api/state');
+  drawJob(state.job);
+  drawList();
+  $('listedAt').textContent = state.contents
+    ? `一覧: ${new Date(state.contents.fetchedAt).toLocaleString('ja-JP')} 時点`
+    : '「一覧を更新」でWebClassから課題を読み込みます';
+}
+
+async function openTask(id) {
+  selected = id;
+  edits.clear();
+  detail = null;
+  drawList();
+  $('detail').replaceChildren(el('p', { className: 'dim', textContent: '読み込み中…' }));
+  try {
+    detail = await api(`/api/task/${id}`);
+  } catch (error) {
+    detail = null;
+    $('detail').replaceChildren(el('p', { className: 'err', textContent: error.message }));
+    return;
+  }
+  drawDetail();
+}
+
+/* ---------------------------------------------------------------- 課題一覧 */
+
+function rows() {
+  const byId = new Map(state.tasks.map((task) => [task.id, task]));
+  const list = [];
+  for (const item of state.contents?.items ?? []) {
+    if (item.material) continue;
+    list.push({ id: item.taskId, item, task: byId.get(item.taskId) ?? null });
+    byId.delete(item.taskId);
+  }
+  for (const task of byId.values()) list.push({ id: task.id, item: task.item ?? {}, task });
+  const words = filter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return list.filter((row) => {
+    const hay = `${row.item?.courseName ?? ''} ${row.item?.title ?? ''}`.toLowerCase();
+    return words.every((word) => hay.includes(word));
+  });
+}
+
+function drawList() {
+  const all = rows();
+  const groups = [
+    ['未提出', all.filter((row) => !row.task || !['submitted', 'unverified'].includes(row.task.status))],
+    ['提出済・要確認', all.filter((row) => row.task && ['submitted', 'unverified'].includes(row.task.status))],
+  ];
+  const box = $('list');
+  box.replaceChildren();
+  for (const [name, group] of groups) {
+    if (group.length === 0) continue;
+    box.append(el('div', { className: 'group', textContent: `${name} (${group.length})` }));
+    for (const row of group) box.append(listRow(row));
+  }
+  if (all.length === 0) box.append(el('p', { className: 'dim small', textContent: '課題がありません。「一覧を更新」を押してください。' }));
+}
+
+function listRow(row) {
+  const [label, kind] = row.task ? (STATUS[row.task.status] ?? [row.task.status, '']) : ['未取得', 'dim'];
+  const meta = el('div', { className: 'meta' }, [
+    pill(label, kind),
+    row.item?.category ? pill(row.item.category, state.attemptCategories.includes(row.item.category) ? 'warn' : '') : null,
+    el('span', { textContent: deadline(row.item?.deadlineAt) }),
+  ]);
+  if (row.task?.approved) meta.append(pill('承認済', 'warn'));
+  if (row.task?.unsupported?.length) meta.append(pill(`未対応設問 ${row.task.unsupported.join(',')}`, 'bad'));
+  const button = el('button', { className: `row ${selected === row.id ? 'on' : ''}` }, [
+    el('div', { className: 'title', textContent: row.item?.title ?? row.id }),
+    el('div', { className: 'small dim', textContent: row.item?.courseName ?? '' }),
+    meta,
+  ]);
+  button.onclick = () => (row.task ? openTask(row.id) : startFetch(row));
+  return button;
+}
+
+function deadline(value) {
+  if (!value) return '期限なし';
+  const date = new Date(value);
+  const left = Math.round((date - Date.now()) / 3600000);
+  const text = date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  if (left < 0) return `${text}（期限切れ）`;
+  return left < 48 ? `${text}（残り${left}時間）` : text;
+}
+
+/* ---------------------------------------------------------------- 課題の詳細 */
+
+function drawDetail() {
+  if (!detail) {
+    $('detail').replaceChildren(el('p', { className: 'dim', textContent: '左の一覧から課題を選んでください。未取得の課題を選ぶと取得できます。' }));
+    return;
+  }
+  const { task } = detail;
+  const [label, kind] = STATUS[task.status] ?? [task.status, ''];
+  const head = el('div', { className: 'card' }, [
+    el('div', { className: 'small dim', textContent: task.item?.courseName ?? '' }),
+    el('h2', { style: 'margin:2px 0 8px;font-size:17px', textContent: task.item?.title ?? task.id }),
+    el('div', { className: 'bar small' }, [
+      pill(label, kind),
+      pill(deadline(task.item?.deadlineAt), task.item?.deadlineAt && new Date(task.item.deadlineAt) < Date.now() ? 'bad' : ''),
+      task.layout === 'paged' ? pill('1ページずつのテスト', 'warn') : null,
+      task.approval ? pill(`承認済 ${task.approval.digest.slice(0, 16)}`, 'warn') : null,
+      el('span', { className: 'dim', textContent: `${detail.questions.length}問 / task-id ${task.id}` }),
+    ]),
+    task.error ? el('p', { className: 'err small', textContent: task.error }) : null,
+    task.unsupported?.length
+      ? el('p', { className: 'small', style: 'color:var(--warn)', textContent: `⚠ 自動入力に未対応の設問: ${task.unsupported.join(', ')}（WebClassで直接解答してください）` })
+      : null,
+    detail.reviewError ? el('p', { className: 'err small', textContent: `未完成: ${detail.reviewError}` }) : null,
+    actionBar(),
+  ]);
+
+  const tabs = el('div', { className: 'tabs' });
+  const names = [['questions', `設問 (${detail.questions.length})`], ['materials', `資料 (${task.materials?.length ?? 0})`]];
+  if (detail.questions.some((question) => question.report)) names.push(['reports', 'レポート']);
+  names.push(['submit', '提出']);
+  for (const [key, text] of names) {
+    const button = el('button', { className: tab === key ? 'on' : '', textContent: text });
+    button.onclick = () => { tab = key; drawDetail(); };
+    tabs.append(button);
+  }
+
+  const body = { questions: viewQuestions, materials: viewMaterials, reports: viewReports, submit: viewSubmit }[tab]();
+  $('detail').replaceChildren(head, tabs, body);
+  drawSaveBar();
+}
+
+function actionBar() {
+  const provider = el('select', { style: 'width:auto' }, [
+    el('option', { value: 'both', textContent: '両方のAI' }),
+    ...state.providers.map((name) => el('option', { value: name, textContent: `${name} だけ` })),
+  ]);
+  const answer = el('button', { className: 'primary', textContent: 'AIに解答を作らせる' });
+  answer.onclick = () => run('answer', { id: selected, provider: provider.value, prefer: 'claude' });
+  const again = el('button', { textContent: '取り直す（fetch）' });
+  again.onclick = () => startFetch({ id: selected, item: detail.task.item });
+  return el('div', { className: 'bar', style: 'margin-top:10px' }, [answer, provider, again]);
+}
+
+/* 設問タブ ---------------------------------------------------------------- */
+
+function valuesOf(question) {
+  if (edits.has(question.number)) return edits.get(question.number);
+  if (question.draft?.values?.length) return [...question.draft.values];
+  if (['checkbox', 'radio'].includes(question.kind)) return [];
+  return question.parts.map(() => '');
+}
+
+function setValues(question, values) {
+  edits.set(question.number, values);
+  const card = document.querySelector(`[data-q="${question.number}"]`);
+  if (card) card.classList.add('dirty');
+  drawSaveBar();
+}
+
+function viewQuestions() {
+  const box = el('div');
+  for (const question of detail.questions) box.append(questionCard(question));
+  if (detail.notes) {
+    box.append(el('div', { className: 'card' }, [
+      el('h3', {}, [el('span', { textContent: 'AIのメモ' })]),
+      el('pre', { className: 'plain', textContent: detail.notes }),
+    ]));
+  }
+  return box;
+}
+
+function questionCard(question) {
+  const source = question.draft?.source;
+  const card = el('div', { className: `card ${question.draft?.conflict ? 'conflict' : ''} ${edits.has(question.number) ? 'dirty' : ''}` });
+  card.dataset.q = question.number;
+  card.append(el('h3', {}, [
+    el('span', { textContent: `設問${question.number}` }),
+    pill(KINDS[question.kind] ?? question.kind),
+    question.points ? pill(`配点 ${question.points}`) : null,
+    question.page ? pill(`ページ${question.page}`) : null,
+    source ? pill(sourceLabel(source), source === 'agreed' ? 'good' : source === 'user' ? 'accent' : '') : null,
+    question.draft?.conflict ? pill(conflictText(question), 'warn') : null,
+    !question.supported ? pill('自動入力に未対応', 'bad') : null,
+  ]));
+  card.append(el('pre', { className: 'qtext', textContent: question.text || '（問題文なし）' }));
+  const retried = detail.task.retry?.questions?.find((item) => item.question === question.number);
+  if (retried) {
+    const grade = retried.grade ? `${retried.grade.mark} ${retried.grade.score}/${retried.grade.max}点` : '本人が誤りと判断';
+    card.append(el('div', { className: 'solver', style: 'margin-bottom:12px;border-color:var(--bad)' }, [
+      el('div', { className: 'small', style: 'color:var(--bad)', textContent: `前回の解答（${grade}）` }),
+      el('pre', { className: 'plain', textContent: retried.describe ?? retried.values.join(' / ') }),
+    ]));
+  }
+
+  if (question.report) {
+    const jump = el('button', { textContent: 'レポート本文を見る・直す' });
+    jump.onclick = () => { tab = 'reports'; drawDetail(); };
+    card.append(el('div', { className: 'bar' }, [
+      el('span', { className: 'small dim', textContent: `提出ファイル: ${question.draft?.values?.[0] ?? '（未作成）'}` }),
+      jump,
+    ]));
+  } else if (question.supported) {
+    card.append(editor(question));
+  }
+
+  const solvers = Object.entries(question.solvers);
+  if (solvers.length) {
+    card.append(el('div', { className: 'grid2', style: 'margin-top:12px' },
+      solvers.map(([name, result]) => solverBox(question, name, result))));
+  }
+  return card;
+}
+
+function sourceLabel(source) {
+  return { agreed: '両AI一致', user: '自分で編集', none: '未解答', correct: '前回正解', wrong: '前回不正解' }[source] ?? source;
+}
+
+function conflictText(question) {
+  if (question.draft?.repeated) return '前回不正解と同じ解答';
+  if (question.draft?.source === 'wrong') return '解き直しが終わっていない';
+  return question.report ? 'AIの本文を読み比べる' : 'AIの案が一致していない';
+}
+
+function solverBox(question, name, result) {
+  const confidence = { high: 'good', medium: 'warn', low: 'bad' }[result.confidence] ?? '';
+  const box = el('div', { className: 'solver' }, [
+    el('div', { className: 'bar small' }, [
+      el('strong', { textContent: name }),
+      result.model ? pill(result.model) : null,
+      result.confidence ? pill(`確信度 ${result.confidence}`, confidence) : null,
+    ]),
+    result.describe ? el('pre', { textContent: result.describe }) : null,
+    result.markdown
+      ? el('details', {}, [el('summary', { className: 'small dim', textContent: 'レポート本文' }), el('pre', { textContent: result.markdown })])
+      : null,
+    result.evidence ? el('div', { className: 'small dim', textContent: `根拠: ${result.evidence}` }) : null,
+  ]);
+  if (result.values && question.supported) {
+    const take = el('button', { className: 'small', textContent: 'この解答を採用', style: 'margin-top:6px' });
+    take.onclick = () => { setValues(question, [...result.values]); drawDetail(); };
+    box.append(take);
+  } else if (result.markdown) {
+    const take = el('button', { className: 'small', textContent: 'この本文を採用してPDFを作る', style: 'margin-top:6px' });
+    take.onclick = () => run('select', { id: selected, provider: name, questions: [question.number] });
+    box.append(take);
+  }
+  return box;
+}
+
+function editor(question) {
+  const values = valuesOf(question);
+  const box = el('div');
+  if (question.kind === 'radio' || question.kind === 'checkbox') {
+    for (const option of question.options) {
+      const input = el('input', {
+        type: question.kind,
+        name: `q${question.number}`,
+        value: option.value,
+        checked: values.includes(option.value),
+      });
+      input.onchange = () => {
+        const next = question.kind === 'radio'
+          ? [option.value]
+          : [...box.querySelectorAll('input:checked')].map((item) => item.value);
+        setValues(question, next);
+      };
+      box.append(el('label', { className: 'opt' }, [input, el('span', { textContent: `${option.value}. ${option.label}` })]));
+    }
+    return box;
+  }
+  // Short answer boxes (記述欄・プルダウン) are laid out in columns; a question with twelve
+  // blanks is unreadable as one tall column.
+  const grid = ['text', 'select'].includes(question.kind) && question.parts.length > 2;
+  const holder = grid ? el('div', { className: 'parts' }) : box;
+  question.parts.forEach((part, index) => {
+    const part_ = el('div', { className: 'part' });
+    part_.append(el('div', { className: 'lab', textContent: partLabel(question, part, index) }));
+    let input;
+    if (question.kind === 'select') {
+      input = el('select', {}, [
+        el('option', { value: '', textContent: '（未選択）' }),
+        ...part.options.map((option) => el('option', { value: option.value, textContent: `${option.value}. ${option.label}` })),
+      ]);
+      input.value = values[index] ?? '';
+    } else if (question.kind === 'textarea') {
+      input = el('textarea', { value: values[index] ?? '', rows: 5 });
+      if (part.maxLength) input.maxLength = part.maxLength;
+    } else if (question.kind === 'file') {
+      input = el('input', { type: 'text', value: values[index] ?? '', placeholder: '課題フォルダ内のファイル名' });
+    } else {
+      input = el('input', { type: 'text', value: values[index] ?? '' });
+      if (part.maxLength) input.maxLength = part.maxLength;
+    }
+    const counter = el('span', { className: 'small dim' });
+    const update = () => {
+      const next = [...valuesOf(question)];
+      while (next.length < question.parts.length) next.push('');
+      next[index] = input.value;
+      setValues(question, next);
+      counter.textContent = countText(part, input.value);
+    };
+    counter.textContent = countText(part, values[index] ?? '');
+    input.oninput = update;
+    input.onchange = update;
+    part_.append(input);
+    if (counter.textContent) part_.append(counter);
+    holder.append(part_);
+  });
+  if (grid) box.append(holder);
+  return box;
+}
+
+function partLabel(question, part, index) {
+  const limits = [part.minLength && `最小${part.minLength}字`, part.maxLength && `最大${part.maxLength}字`].filter(Boolean).join(' / ');
+  return `${part.label || `(${index + 1})`}${limits ? ` ${limits}` : ''}`;
+}
+
+function countText(part, value) {
+  if (!part.minLength && !part.maxLength) return '';
+  const short = part.minLength && value.length < part.minLength;
+  return `${value.length}字${short ? `（あと${part.minLength - value.length}字）` : ''}`;
+}
+
+/* 資料タブ ---------------------------------------------------------------- */
+
+function viewMaterials() {
+  const materials = detail.task.materials ?? [];
+  if (materials.length === 0) {
+    return el('p', { className: 'dim', textContent: '資料は取得していません。fetch のときに自動で集めます。' });
+  }
+  const box = el('div');
+  for (const material of materials) {
+    const card = el('div', { className: 'card' }, [
+      el('h3', {}, [
+        el('span', { textContent: material.title }),
+        material.readable ? null : pill('文字を読み取れませんでした', 'bad'),
+      ]),
+      el('div', { className: 'bar small' }, [
+        material.textFile ? el('a', { href: fileUrl(material.textFile), target: '_blank', textContent: 'テキストを開く' }) : null,
+      ]),
+    ]);
+    if (material.textFile) {
+      const details = el('details', {}, [el('summary', { className: 'small dim', textContent: 'テキストをここで読む' })]);
+      details.ontoggle = async () => {
+        if (!details.open || details.dataset.loaded) return;
+        details.dataset.loaded = '1';
+        const text = await fetch(fileUrl(material.textFile), { headers: { 'x-task-token': TOKEN } }).then((response) => response.text());
+        details.append(el('pre', { className: 'plain', textContent: text }));
+      };
+      card.append(details);
+    }
+    for (const directory of material.images ?? []) {
+      const details = el('details', {}, [el('summary', { className: 'small dim', textContent: `ページ画像（図・グラフ・表はこちら） ${directory}` })]);
+      details.ontoggle = async () => {
+        if (!details.open || details.dataset.loaded) return;
+        details.dataset.loaded = '1';
+        const { names } = await api(`/api/task/${selected}/dir?path=${encodeURIComponent(directory)}`);
+        const pages = el('div', { className: 'pages' }, names.map((name) => el('a', {
+          href: fileUrl(directory + name), target: '_blank', title: name,
+        }, [el('img', { src: fileUrl(directory + name), loading: 'lazy', alt: name })])));
+        details.append(names.length ? pages : el('p', { className: 'dim small', textContent: 'ページ画像はありません。' }));
+      };
+      card.append(details);
+    }
+    box.append(card);
+  }
+  return box;
+}
+
+/* レポートタブ ---------------------------------------------------------------- */
+
+function viewReports() {
+  const box = el('div');
+  for (const question of detail.questions.filter((item) => item.report)) {
+    const area = el('textarea', { value: question.report.markdown, rows: 20 });
+    const save = el('button', { textContent: '本文を保存' });
+    // The server returns the task again, so `detail` holds the saved text and redrawing the
+    // tab later shows it instead of the text from before the save.
+    const saveReport = (button) => guard(button, async () => {
+      detail = await api(`/api/task/${selected}/report/${question.number}`, {
+        method: 'PUT', body: JSON.stringify({ markdown: area.value }),
+      });
+    });
+    save.onclick = async () => {
+      try {
+        await saveReport(save);
+        toast('保存しました。PDFを作り直すと提出ファイルが更新されます。');
+      } catch (error) {
+        toast(`保存できませんでした: ${error.message}`, true);
+      }
+    };
+    const render = el('button', { className: 'primary', textContent: '保存してPDFを作り直す' });
+    render.onclick = async () => {
+      try {
+        await saveReport(render);
+      } catch (error) {
+        toast(`保存できなかったため、PDFは作り直していません: ${error.message}`, true);
+        return;
+      }
+      run('render', { id: selected, questions: [question.number] });
+    };
+    box.append(el('div', { className: 'card' }, [
+      el('h3', {}, [
+        el('span', { textContent: `設問${question.number} のレポート` }),
+        pill(question.report.markdownFile),
+        question.report.pdfExists ? pill('PDFあり', 'good') : pill('PDF未作成', 'warn'),
+      ]),
+      el('pre', { className: 'qtext', textContent: question.text }),
+      area,
+      el('div', { className: 'bar', style: 'margin-top:8px' }, [save, render,
+        el('span', { className: 'small dim', textContent: '使える記法: 見出し・箇条書き・表・**強調**・コード' })]),
+      question.report.pdfExists
+        ? el('details', { open: true }, [
+          el('summary', { className: 'small dim', textContent: `提出するPDF (${question.report.pdfFile})` }),
+          el('p', { className: 'small' }, [el('a', {
+            href: fileUrl(question.report.pdfFile), target: '_blank',
+            textContent: 'PDFを別のタブで開く（下に表示されないとき）',
+          })]),
+          el('iframe', { className: 'pdf', src: fileUrl(question.report.pdfFile) }),
+        ])
+        : null,
+    ]));
+  }
+  return box;
+}
+
+/* 提出タブ ---------------------------------------------------------------- */
+
+function viewSubmit() {
+  const { task } = detail;
+  const box = el('div');
+  const attempt = el('input', { type: 'checkbox' });
+  const attemptLabel = el('label', { className: 'opt small' }, [attempt,
+    el('span', { textContent: '試験・テストの受験回数や制限時間を消費してもよい（--allow-attempt）' })]);
+
+  const problems = detail.questions.filter((question) => question.draft?.conflict
+    || Object.values(question.solvers).some((result) => result.confidence === 'low'));
+  const checklist = el('div', { className: 'card' }, [
+    el('h3', {}, [el('span', { textContent: '提出前の確認' })]),
+    el('ul', {}, [
+      el('li', { textContent: `解答: ${detail.questions.filter((question) => question.draft?.values?.length).length} / ${detail.questions.length} 問に記入済み` }),
+      el('li', { textContent: `AIの案が一致しない・確信度lowの設問: ${problems.length ? problems.map((question) => `設問${question.number}`).join(', ') : 'なし'}` }),
+      el('li', { textContent: `未保存の編集: ${edits.size ? `${edits.size}件（先に保存してください）` : 'なし'}` }),
+    ]),
+    detail.digest
+      ? el('div', { className: 'small' }, [el('span', { textContent: '承認用ハッシュ: ' }), el('code', { textContent: detail.digest.slice(0, 16) })])
+      : el('p', { className: 'err small', textContent: detail.reviewError ?? '解答が揃っていません。' }),
+  ]);
+
+  const dry = el('button', { textContent: '入力だけ試す（提出しない）' });
+  dry.onclick = () => run('dry-run', { id: selected, allowAttempt: attempt.checked });
+  const approve = el('button', { textContent: 'この解答を承認する', disabled: !detail.digest || task.approval?.digest === detail.digest });
+  approve.onclick = () => confirmApprove();
+  const submit = el('button', {
+    className: 'danger',
+    textContent: '提出する（採点ボタンを押す）',
+    disabled: !(task.status === 'approved' && task.approval?.digest === detail.digest),
+  });
+  submit.onclick = () => confirmSubmit(attempt.checked);
+
+  box.append(checklist, el('div', { className: 'card' }, [
+    el('h3', {}, [el('span', { textContent: '提出' })]),
+    el('p', { className: 'small dim', textContent: '承認 → 提出の順です。answer.json を1文字でも変えると承認はやり直しになります。' }),
+    attemptLabel,
+    el('div', { className: 'bar', style: 'margin-top:8px' }, [dry, approve, submit]),
+  ]));
+
+  if (detail.grades?.length || task.retry || ['submitted', 'unverified'].includes(task.status)) box.append(gradesCard());
+  if (detail.screenshots.length) {
+    box.append(el('div', { className: 'card' }, [
+      el('h3', {}, [el('span', { textContent: 'WebClassの画面' })]),
+      el('div', { className: 'shots' }, detail.screenshots.map((name) => el('a', { href: fileUrl(name), target: '_blank' }, [
+        el('img', { src: fileUrl(name), loading: 'lazy', alt: name }),
+        el('div', { className: 'small dim', textContent: name }),
+      ]))),
+    ]));
+  }
+  if (detail.receipt) {
+    box.append(el('div', { className: 'card' }, [
+      el('h3', {}, [el('span', { textContent: '提出結果 (submission-receipt.txt)' })]),
+      el('pre', { className: 'plain', textContent: detail.receipt }),
+    ]));
+  }
+  return box;
+}
+
+// Grades read from WebClass's result table, and the retry of the questions that lost points.
+function gradesCard() {
+  const { task } = detail;
+  const grades = detail.grades ?? [];
+  const current = ['submitted', 'unverified'].includes(task.status);
+  const card = el('div', { className: 'card' }, [
+    el('h3', {}, [el('span', { textContent: current ? '採点結果' : `前回（${task.attempts?.length ?? ''}回目）の採点結果` })]),
+  ]);
+  if (grades.length) {
+    const total = grades.reduce((sum, item) => sum + item.score, 0);
+    const max = grades.reduce((sum, item) => sum + item.max, 0);
+    card.append(el('table', { className: 'grades small' }, [
+      el('tr', {}, ['設問', '結果', '得点', 'WebClassに表示された解答'].map((text) => el('th', { textContent: text }))),
+      ...grades.map((item) => el('tr', {}, [
+        el('td', { textContent: `設問${item.question}` }),
+        el('td', {}, [pill(item.mark || '-', item.score >= item.max ? 'good' : 'bad')]),
+        el('td', { textContent: `${item.score}/${item.max}` }),
+        el('td', { className: 'dim', textContent: item.answer }),
+      ])),
+      el('tr', {}, [el('td', { textContent: '合計' }), el('td'), el('td', { textContent: `${total}/${max}` }), el('td')]),
+    ]));
+  } else {
+    card.append(el('p', { className: 'small dim', textContent: '提出結果に採点表が見つかりませんでした。解き直す設問を番号で指定してください。' }));
+  }
+  // While the retry is still a draft, its solvers can be run again on the same questions.
+  const resumable = Boolean(task.retry) && ['answered', 'approved', 'fetched'].includes(task.status);
+  if (!current && !resumable) return card;
+
+  const wrong = resumable
+    ? task.retry.questions.map((item) => item.question)
+    : grades.filter((item) => item.score < item.max).map((item) => item.question);
+  const numbers = el('input', { type: 'text', value: wrong.join(' '), placeholder: '例: 2 4', style: 'width:140px' });
+  const provider = el('select', { style: 'width:auto' }, [
+    el('option', { value: 'both', textContent: '両方のAI' }),
+    ...state.providers.map((name) => el('option', { value: name, textContent: `${name} だけ` })),
+  ]);
+  const retry = el('button', { className: 'primary', textContent: resumable ? 'もう一度AIに解き直させる' : '間違えた設問を解き直す' });
+  retry.onclick = () => {
+    const questions = numbers.value.split(/[\s,、]+/).filter(Boolean);
+    if (!questions.length) return toast('解き直す設問の番号を入れてください。', true);
+    modal({
+      title: '間違えた設問を解き直しますか',
+      lead: `設問${questions.join(', ')} だけをAIに解き直させます。ほかの設問は前回の解答のままです。`,
+      body: [el('ul', {}, [
+        resumable ? null : el('li', { textContent: '前回の提出記録（結果・スクリーンショット・解答）は attempts/ フォルダに移します。' }),
+        el('li', { textContent: 'AIには前回の解答が不正解だったことを伝えます。' }),
+        el('li', { textContent: '提出はしません。いつもどおり確認 → 承認 → 提出の順です。' }),
+      ])],
+      label: '解き直す',
+      action: async () => run('retry', { id: selected, provider: provider.value, questions }),
+    });
+  };
+  card.append(el('div', { className: 'bar' }, [el('span', { className: 'small dim', textContent: '解き直す設問:' }), numbers, provider, retry]));
+  return card;
+}
+
+function confirmApprove() {
+  const list = el('div');
+  for (const question of detail.questions) {
+    list.append(el('div', { style: 'margin-bottom:8px' }, [
+      el('div', { className: 'small dim', textContent: `設問${question.number}${question.draft?.conflict ? ' ⚠ AIの案が一致していません' : ''}` }),
+      el('pre', { className: 'plain', textContent: question.describe ?? '（未解答）' }),
+    ]));
+  }
+  modal({
+    title: 'この内容を承認しますか',
+    lead: '承認するのは、いま表示されている解答そのものです。中身を読んでから承認してください。',
+    body: [list, el('div', { className: 'small' }, [el('span', { textContent: 'ハッシュ: ' }), el('code', { textContent: detail.digest.slice(0, 16) })])],
+    label: '承認する',
+    action: async () => {
+      detail = await api(`/api/task/${selected}/approve`, { method: 'POST', body: JSON.stringify({ digest: detail.digest }) });
+      drawDetail();
+      await refreshState();
+      toast('承認しました。提出ボタンが押せます。');
+    },
+  });
+}
+
+function confirmSubmit(allowAttempt) {
+  modal({
+    title: '本当に提出しますか',
+    lead: 'WebClassの［採点］ボタンを押します。取り消せません。',
+    body: [el('ul', {}, [
+      el('li', { textContent: `${detail.task.item?.courseName ?? ''} / ${detail.task.item?.title ?? ''}` }),
+      el('li', { textContent: `承認済みハッシュ: ${detail.task.approval?.digest.slice(0, 16)}` }),
+      el('li', { textContent: allowAttempt ? '受験回数の消費を許可して実行します' : '受験回数の消費は許可していません' }),
+    ])],
+    label: '提出する',
+    danger: true,
+    action: async () => run('submit', { id: selected, allowAttempt }),
+  });
+}
+
+/* ---------------------------------------------------------------- 保存・取得 */
+
+function drawSaveBar() {
+  $('savebar').className = `savebar ${edits.size ? 'on' : ''}`;
+  $('saveCount').textContent = `${edits.size}件の設問を編集しました`;
+}
+
+$('save').onclick = async () => {
+  const answers = [...edits.entries()].map(([question, values]) => ({ question, values }));
+  try {
+    detail = await guard($('save'), () => api(`/api/task/${selected}/answer`, { method: 'PUT', body: JSON.stringify({ answers }) }));
+    edits.clear();
+    drawDetail();
+    await refreshState();
+    toast('保存しました。承認はやり直しになります。');
+  } catch (error) {
+    toast(error.message, true);
+  }
+};
+$('discard').onclick = () => { edits.clear(); drawDetail(); };
+
+function startFetch(row) {
+  const attempt = el('input', { type: 'checkbox' });
+  const materials = el('input', { type: 'checkbox', checked: true });
+  // WebClass is told which item to open by its contents id; the words are only shown so the
+  // choice can be checked, and searching by them is the fallback when the id is unknown.
+  const contentsId = row.item?.contentsId ?? null;
+  const words = [row.item?.courseName, row.item?.title].filter(Boolean).join(' ');
+  const query = el('input', { type: 'text', value: words });
+  const risky = state.attemptCategories.includes(row.item?.category);
+  const status = row.task?.status ?? (row.id === selected ? detail?.task?.status : null);
+  const submitted = ['submitting', 'submitted', 'unverified'].includes(status);
+  const force = el('input', { type: 'checkbox' });
+  modal({
+    title: '課題を取得しますか',
+    lead: `${row.item?.courseName ?? ''} / ${row.item?.title ?? ''}`,
+    body: [
+      el('p', { className: 'small dim', textContent: 'WebClassを開いて［開始］を押し、設問と資料を読み取ります。入力も採点もしません。' }),
+      risky ? el('p', { style: 'color:var(--warn)', textContent: `⚠ 種別が「${row.item.category}」です。開くと受験回数や制限時間を消費する可能性があります。` }) : null,
+      el('label', { className: 'opt small' }, [attempt, el('span', { textContent: '受験回数・制限時間の消費を許可する（--allow-attempt）' })]),
+      el('label', { className: 'opt small' }, [materials, el('span', { textContent: '講義資料もいっしょに取得する' })]),
+      submitted ? el('p', { className: 'err small', textContent: `この課題は提出処理に入っています（${STATUS[status]?.[0] ?? status}）。取り直すと、もう一度解答・提出できる状態に戻ります。結果を確認してから選んでください。` }) : null,
+      submitted ? el('label', { className: 'opt small' }, [force, el('span', { textContent: '提出の記録を残したまま取り直す（--force）' })]) : null,
+      el('div', { className: 'part' }, [
+        el('div', { className: 'lab', textContent: contentsId
+          ? 'この課題を取得します（書き換えると、その言葉に一致する課題を探します）'
+          : '課題の指定（授業名と課題名に含まれる言葉）' }),
+        query,
+      ]),
+    ],
+    label: '取得する',
+    action: async () => run('fetch', {
+      ...(contentsId && query.value.trim() === words ? { contentsId } : { query: query.value }),
+      allowAttempt: attempt.checked,
+      materials: materials.checked,
+      force: submitted && force.checked,
+    }),
+  });
+}
+
+/* ---------------------------------------------------------------- 操作（ジョブ） */
+
+async function run(action, params) {
+  try {
+    await api('/api/job', { method: 'POST', body: JSON.stringify({ action, ...params }) });
+    $('log').classList.add('open');
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function guard(button, work) {
+  button.disabled = true;
+  try {
+    return await work();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+let ticker = null;
+function drawJob(job) {
+  const running = job?.status === 'running';
+  $('logIcon').replaceChildren(running ? el('span', { className: 'spin' }) : el('span', { textContent: job ? (job.status === 'done' ? '✅' : '⚠') : '📄' }));
+  $('logLabel').textContent = job ? job.label : '操作ログ';
+  $('cancel').style.display = running && job.cancellable ? '' : 'none';
+  $('logBody').textContent = (job?.lines ?? []).join('\n');
+  $('logBody').scrollTop = $('logBody').scrollHeight;
+  clearInterval(ticker);
+  const meta = () => {
+    if (!job) { $('logMeta').textContent = ''; return; }
+    const seconds = Math.round((Date.now() - new Date(job.startedAt)) / 1000);
+    $('logMeta').textContent = running
+      ? `実行中 ${seconds}秒 — ${job.command}`
+      : `${job.status === 'done' ? '完了' : `失敗 (exit ${job.exitCode})`} — ${job.command}`;
+  };
+  meta();
+  if (running) ticker = setInterval(meta, 1000);
+}
+
+$('cancel').onclick = async (event) => {
+  event.stopPropagation();
+  try {
+    drawJob((await api('/api/job/cancel', { method: 'POST' })).job);
+  } catch (error) {
+    toast(error.message, true);
+  }
+};
+$('logHead').onclick = () => {
+  $('log').classList.toggle('open');
+  $('logToggle').textContent = $('log').classList.contains('open') ? '▼' : '▲';
+};
+$('reload').onclick = () => run('list', {});
+$('filter').oninput = (event) => { filter = event.target.value; drawList(); };
+
+/* ---------------------------------------------------------------- モーダル */
+
+function modal({ title, lead, body, label, action, danger = false }) {
+  const confirm = el('button', { className: danger ? 'danger' : 'primary', textContent: label });
+  const close = el('button', { textContent: 'やめる' });
+  close.onclick = () => $('veil').classList.remove('on');
+  confirm.onclick = async () => {
+    confirm.disabled = true;
+    try {
+      await action();
+      $('veil').classList.remove('on');
+    } catch (error) {
+      toast(error.message, true);
+      confirm.disabled = false;
+    }
+  };
+  $('veilBox').replaceChildren(
+    el('h2', { style: 'margin:0 0 6px;font-size:16px', textContent: title }),
+    el('p', { className: 'dim small', textContent: lead ?? '' }),
+    ...[].concat(body).filter(Boolean),
+    el('div', { className: 'bar', style: 'margin-top:14px;justify-content:flex-end' }, [close, confirm]),
+  );
+  $('veil').classList.add('on');
+}
+$('veil').onclick = (event) => { if (event.target === $('veil')) $('veil').classList.remove('on'); };
+document.onkeydown = (event) => { if (event.key === 'Escape') $('veil').classList.remove('on'); };
+
+/* ---------------------------------------------------------------- 起動 */
+
+const events = new EventSource(`/api/events?t=${TOKEN}`);
+events.onmessage = async (message) => {
+  const event = JSON.parse(message.data);
+  if (event.type === 'log') {
+    $('logBody').textContent += `${$('logBody').textContent ? '\n' : ''}${event.line}`;
+    $('logBody').scrollTop = $('logBody').scrollHeight;
+    return;
+  }
+  drawJob(event.job);
+  if (event.job && event.job.status !== 'running') {
+    await refreshState();
+    const target = event.job.taskId ?? (event.job.action === 'fetch' ? lastFetched(event.job) : null);
+    if (target && target !== selected) await openTask(target);
+    else if (selected) {
+      // openTask() clears `edits`, so a copy is kept to put the unsaved edits back.
+      const keep = new Map(edits);
+      await openTask(selected);
+      edits = keep;
+      drawDetail();
+    }
+    toast(event.job.status === 'done' ? `「${event.job.label}」が終わりました。` : `「${event.job.label}」が失敗しました。ログを見てください。`, event.job.status !== 'done');
+  }
+};
+events.onerror = () => toast('サーバーとの接続が切れました。npm run task:ui が動いているか確認してください。', true);
+
+function lastFetched(job) {
+  return job.lines.map((line) => line.match(/^task-id:\s*([a-f0-9]{16})/)?.[1]).filter(Boolean).pop() ?? null;
+}
+
+drawDetail();
+refreshState().catch((error) => toast(error.message, true));
+</script>
+</body>
+</html>

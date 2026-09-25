@@ -1,0 +1,15 @@
+# logrotate config for the cron output of the WebClass check.
+# Install on the VPS:
+#   cp deploy/logrotate-webclass-cron /etc/logrotate.d/webclass-cron
+# The app itself writes logs/check-YYYY-MM-DD.log and deletes old ones, but cron.log
+# is appended by the shell redirect and would otherwise grow forever.
+/root/discordbot/discordbot_webclass/logs/cron.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # cron appends with >>, so truncating in place is safe and needs no restart.
+    copytruncate
+}

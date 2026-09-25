@@ -1,12 +1,13 @@
 import { loadConfig } from './config.js';
 import {
-  assignmentEmbed,
   resolveDiscordOwnerUserId,
   sendDiscordDm,
   sendDiscordMessage,
 } from './discord.js';
 import { fetchAssignmentsWithRetry } from './fetch-with-retry.js';
 import { initializeLogger } from './logger.js';
+import { loadMutedCourses, MUTES_PATH, partitionMutedNotifications } from './mutes.js';
+import { toDiscordPayload } from './notification-payload.js';
 import { notificationDestination } from './notification-routing.js';
 import { acquireRunLock } from './run-lock.js';
 import {
@@ -15,13 +16,21 @@ import {
   markFailure,
   markSuccess,
   saveRuntimeStatus,
+  shouldNotifyFailure,
+  shouldNotifyRecovery,
 } from './runtime-status.js';
-import { buildNotifications, loadState, saveState } from './state.js';
+import {
+  buildNotifications,
+  buildStateAfterSending,
+  carryOverUnfetchedAssignments,
+  loadState,
+  saveState,
+  STATE_PATH,
+} from './state.js';
+import { fetchAssignmentSnapshot } from './webclass.js';
 
-const STATE_PATH = 'data/state.json';
 const RUNTIME_STATUS_PATH = 'data/runtime-status.json';
 const LOCK_PATH = 'data/check.lock';
-const ERROR_NOTIFICATION_THRESHOLD = 3;
 
 async function main() {
   const config = loadConfig();
@@ -34,15 +43,62 @@ async function main() {
   }
 
   let runtimeStatus = markAttempt(await loadRuntimeStatus(RUNTIME_STATUS_PATH));
+  const previousConsecutiveFailures = runtimeStatus.consecutiveFailures ?? 0;
   await saveRuntimeStatus(RUNTIME_STATUS_PATH, runtimeStatus);
+
+  const recordFailure = async (error) => {
+    runtimeStatus = markFailure(runtimeStatus, error);
+    await saveRuntimeStatus(RUNTIME_STATUS_PATH, runtimeStatus);
+    console.error(error);
+
+    if (shouldNotifyFailure(runtimeStatus)) {
+      await sendFailureNotification(config, runtimeStatus).catch((notificationError) => {
+        console.error('Failed to send WebClass error notification:', notificationError);
+      });
+    }
+  };
+
+  // A hung browser or network call must not keep the lock forever, so the whole
+  // check is aborted after the configured time.
+  const watchdog = setTimeout(async () => {
+    // Exit even if recording the failure itself hangs.
+    setTimeout(() => process.exit(1), 60000).unref();
+    try {
+      await recordFailure(
+        new Error(`WebClass check timed out after ${config.checkTimeoutMinutes} minutes.`),
+      );
+    } finally {
+      await releaseLock().catch(() => undefined);
+      process.exit(1);
+    }
+  }, config.checkTimeoutMinutes * 60 * 1000);
+  watchdog.unref();
 
   try {
     const previousState = await loadState(STATE_PATH);
-    const assignments = await fetchAssignmentsWithRetry(config);
-    const { notifications, notified, firstRun } = buildNotifications(
-      previousState,
-      assignments,
+    const { assignments, failedUrls } = await fetchAssignmentsWithRetry(config, {
+      fetcher: fetchAssignmentSnapshot,
+    });
+    const built = buildNotifications(previousState, assignments);
+    const { firstRun } = built;
+    const { muted, active } = partitionMutedNotifications(
+      built.notifications,
+      await loadMutedCourses(MUTES_PATH),
     );
+    // Muted notifications come first and count as delivered without being sent.
+    const notifications = [...muted, ...active];
+    if (muted.length) {
+      console.log(`Skipped ${muted.length} notification(s) for muted courses.`);
+    }
+    const carriedAssignments = failedUrls.length
+      ? carryOverUnfetchedAssignments(previousState.assignments, assignments)
+      : [];
+
+    if (failedUrls.length) {
+      console.warn(
+        `Could not read ${failedUrls.length} WebClass page(s); kept ${carriedAssignments.length} previous assignment(s).`,
+      );
+    }
 
     if (firstRun) {
       await sendDiscordMessage(config, {
@@ -50,22 +106,37 @@ async function main() {
       });
     }
 
-    for (const notification of notifications) {
-      const payload = toDiscordPayload(notification);
-      if (notificationDestination(notification) === 'ownerDm') {
-        const ownerUserId = await resolveDiscordOwnerUserId(config);
-        await sendDiscordDm(config, ownerUserId, payload);
-      } else {
-        await sendDiscordMessage(config, payload);
+    // Save after every delivery so a failure or crash midway never re-sends earlier notices.
+    const saveProgress = (sentCount) => {
+      const state = buildStateAfterSending(previousState, assignments, notifications, sentCount);
+      return saveState(STATE_PATH, {
+        assignments: [...state.assignments, ...carriedAssignments],
+        notified: state.notified,
+      });
+    };
+
+    for (const [index, notification] of notifications.entries()) {
+      if (index < muted.length) {
+        continue;
       }
+      const payload = toDiscordPayload(notification);
+      try {
+        if (notificationDestination(notification) === 'ownerDm') {
+          const ownerUserId = await resolveDiscordOwnerUserId(config);
+          await sendDiscordDm(config, ownerUserId, payload);
+        } else {
+          await sendDiscordMessage(config, payload);
+        }
+      } catch (error) {
+        await saveProgress(index);
+        throw error;
+      }
+      await saveProgress(index + 1);
     }
 
-    await saveState(STATE_PATH, {
-      assignments,
-      notified,
-    });
+    await saveProgress(notifications.length);
 
-    const notificationCount = notifications.length + (firstRun ? 1 : 0);
+    const notificationCount = active.length + (firstRun ? 1 : 0);
     runtimeStatus = markSuccess(
       runtimeStatus,
       assignments.length,
@@ -73,24 +144,37 @@ async function main() {
     );
     await saveRuntimeStatus(RUNTIME_STATUS_PATH, runtimeStatus);
 
+    if (shouldNotifyRecovery(previousConsecutiveFailures)) {
+      await sendRecoveryNotification(config, previousConsecutiveFailures).catch(
+        (notificationError) => {
+          console.error('Failed to send WebClass recovery notification:', notificationError);
+        },
+      );
+    }
+
     console.log(
       `Done. assignments=${assignments.length} notifications=${notificationCount}`,
     );
   } catch (error) {
-    runtimeStatus = markFailure(runtimeStatus, error);
-    await saveRuntimeStatus(RUNTIME_STATUS_PATH, runtimeStatus);
-    console.error(error);
-
-    if (runtimeStatus.consecutiveFailures === ERROR_NOTIFICATION_THRESHOLD) {
-      await sendFailureNotification(config, runtimeStatus).catch((notificationError) => {
-        console.error('Failed to send WebClass error notification:', notificationError);
-      });
-    }
-
+    await recordFailure(error);
     process.exitCode = 1;
   } finally {
+    clearTimeout(watchdog);
     await releaseLock();
   }
+}
+
+async function sendRecoveryNotification(config, failureCount) {
+  await sendDiscordMessage(config, {
+    embeds: [
+      {
+        title: 'WebClassの自動取得が復旧しました',
+        description: `**${failureCount}回連続失敗の後、正常に取得できました**`,
+        color: 0x27ae60,
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  });
 }
 
 async function sendFailureNotification(config, runtimeStatus) {
@@ -118,67 +202,6 @@ async function sendFailureNotification(config, runtimeStatus) {
 
 function truncate(value, maxLength) {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
-}
-
-function toDiscordPayload(notification) {
-  const { assignment } = notification;
-
-  if (notification.type === 'newAssignment') {
-    return {
-      embeds: [
-        assignmentEmbed('新しい課題が追加されました', '**新規課題**', assignment, 0x2f80ed),
-      ],
-    };
-  }
-
-  if (notification.type === 'deadlineChanged') {
-    return {
-      embeds: [
-        {
-          title: '課題の提出期限が変更されました',
-          description: '**締切変更**',
-          color: 0xf2994a,
-          fields: [
-            { name: '授業', value: assignment.courseName || '不明' },
-            { name: '課題名', value: assignment.title || '不明' },
-            {
-              name: '変更点',
-              value: `~~${notification.previousDeadlineText}~~ → **${assignment.deadlineText || '不明'}**`,
-            },
-          ],
-          timestamp: new Date().toISOString(),
-        },
-      ],
-    };
-  }
-
-  if (notification.type === 'deadlineSoon') {
-    return {
-      embeds: [
-        assignmentEmbed(
-          '課題の提出期限まで24時間を切りました',
-          '**締切まで24時間以内**',
-          assignment,
-          0xeb5757,
-        ),
-      ],
-    };
-  }
-
-  if (notification.type === 'dueTodayUnsubmitted') {
-    return {
-      embeds: [
-        assignmentEmbed(
-          '本日締切の未提出課題があります',
-          '**未提出・本日締切**',
-          assignment,
-          0xc0392b,
-        ),
-      ],
-    };
-  }
-
-  throw new Error(`Unknown notification type: ${notification.type}`);
 }
 
 main().catch((error) => {

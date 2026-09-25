@@ -12,13 +12,23 @@ import {
 import { loadConfig } from './config.js';
 import { requiresOwner } from './command-access.js';
 import { resolveDiscordOwnerUserId } from './discord.js';
-import { fetchAssignmentsWithRetry } from './fetch-with-retry.js';
 import { initializeLogger } from './logger.js';
+import {
+  addMutedCourse,
+  courseChoices,
+  isMutedCourse,
+  loadMutedCourses,
+  MUTES_PATH,
+  removeMutedCourse,
+  resolveCourseInput,
+  saveMutedCourses,
+  uniqueCourseNames,
+} from './mutes.js';
 import { loadRuntimeStatus } from './runtime-status.js';
+import { activeAssignments, loadState, STATE_PATH } from './state.js';
 
 const RUNTIME_STATUS_PATH = 'data/runtime-status.json';
 const startedAt = new Date();
-let activeFetch = null;
 
 const COMMANDS = [
   {
@@ -49,7 +59,41 @@ const COMMANDS = [
     name: 'webclass-status',
     description: 'WebClass自動巡回の稼働状態を表示します',
   },
+  {
+    name: 'webclass-mute',
+    description: '指定した授業の自動通知をミュートします（所有者専用）',
+    options: [
+      {
+        type: ApplicationCommandOptionType.String,
+        name: 'course',
+        description: 'ミュートする授業名',
+        required: true,
+        autocomplete: true,
+      },
+    ],
+  },
+  {
+    name: 'webclass-unmute',
+    description: '授業の自動通知のミュートを解除します（所有者専用）',
+    options: [
+      {
+        type: ApplicationCommandOptionType.String,
+        name: 'course',
+        description: 'ミュートを解除する授業名',
+        required: true,
+        autocomplete: true,
+      },
+    ],
+  },
+  {
+    name: 'webclass-mutes',
+    description: 'ミュート中の授業を表示します（所有者専用）',
+  },
 ];
+
+const MUTE_COMMANDS = new Set(['webclass-mute', 'webclass-unmute', 'webclass-mutes']);
+// Serializes read-modify-write of the mute file when commands arrive at the same time.
+let muteUpdateQueue = Promise.resolve();
 
 async function main() {
   const config = loadConfig();
@@ -61,12 +105,17 @@ async function main() {
     ownerUserId = await resolveDiscordOwnerUserId(config);
     await registerCommands(client, config);
     console.log(`Logged in as ${client.user.tag}`);
-    console.log(
-      'Commands: /webclass-all, /webclass-unsubmitted, /webclass-next, /webclass-closest, /webclass-status',
-    );
+    console.log(`Commands: ${COMMANDS.map((command) => `/${command.name}`).join(', ')}`);
   });
 
   client.on('interactionCreate', async (interaction) => {
+    if (interaction.isAutocomplete()) {
+      await respondToCourseAutocomplete(interaction, ownerUserId).catch((error) => {
+        console.error(error);
+      });
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) {
       return;
     }
@@ -100,12 +149,29 @@ async function main() {
         return;
       }
 
-      const assignments = await getAssignments(config);
-      await respondWithAssignments(interaction, assignments);
+      if (MUTE_COMMANDS.has(interaction.commandName)) {
+        await handleMuteCommand(interaction);
+        return;
+      }
+
+      // Commands answer from the last scheduled check instead of launching a browser.
+      const state = await loadState(STATE_PATH);
+      if (state.isFirstRun) {
+        await interaction.editReply(
+          'まだ自動巡回のデータがありません。次回の自動巡回（3時間ごと）の後に試してください。',
+        );
+        return;
+      }
+
+      const context = {
+        ephemeral: ownerOnly,
+        content: await buildDataNote(state),
+      };
+      await respondWithAssignments(interaction, activeAssignments(state.assignments), context);
     } catch (error) {
       console.error(error);
       await interaction.editReply(
-        'WebClassの取得中にエラーが発生しました。再試行にも失敗したため、しばらくしてから試してください。',
+        '課題データの読み込み中にエラーが発生しました。しばらくしてから試してください。',
       );
     }
   });
@@ -113,16 +179,99 @@ async function main() {
   await client.login(config.discordBotToken);
 }
 
-async function getAssignments(config) {
-  if (!activeFetch) {
-    activeFetch = fetchAssignmentsWithRetry(config).finally(() => {
-      activeFetch = null;
-    });
+async function respondToCourseAutocomplete(interaction, ownerUserId) {
+  if (!MUTE_COMMANDS.has(interaction.commandName) || interaction.user.id !== ownerUserId) {
+    await interaction.respond([]);
+    return;
   }
-  return activeFetch;
+
+  const mutedCourses = await loadMutedCourses(MUTES_PATH);
+  const query = interaction.options.getFocused();
+  if (interaction.commandName === 'webclass-unmute') {
+    await interaction.respond(courseChoices(mutedCourses, query));
+    return;
+  }
+
+  const state = await loadState(STATE_PATH);
+  const candidates = uniqueCourseNames(state.assignments).filter(
+    (name) => !isMutedCourse(mutedCourses, name),
+  );
+  await interaction.respond(courseChoices(candidates, query));
 }
 
-async function respondWithAssignments(interaction, assignments) {
+async function handleMuteCommand(interaction) {
+  if (interaction.commandName === 'webclass-mutes') {
+    const mutedCourses = await loadMutedCourses(MUTES_PATH);
+    await interaction.editReply(
+      mutedCourses.length
+        ? `🔇 ミュート中の授業（${mutedCourses.length}件）\n${mutedCourses.map((name) => `- ${name}`).join('\n')}`
+        : 'ミュート中の授業はありません。',
+    );
+    return;
+  }
+
+  const input = interaction.options.getString('course', true).trim();
+  if (!input) {
+    await interaction.editReply('授業名を入力してください。');
+    return;
+  }
+
+  const update = muteUpdateQueue.then(async () => {
+    const mutedCourses = await loadMutedCourses(MUTES_PATH);
+
+    if (interaction.commandName === 'webclass-unmute') {
+      const course = resolveCourseInput(input, mutedCourses);
+      const result = course ? removeMutedCourse(mutedCourses, course.name) : { changed: false };
+      if (!result.changed) {
+        return course
+          ? `「${course.name}」はミュートされていません。`
+          : '選択した授業はミュートされていません。';
+      }
+      await saveMutedCourses(MUTES_PATH, result.courses);
+      return `🔔 「${course.name}」のミュートを解除しました。次回の自動巡回から通知が届きます。`;
+    }
+
+    // Prefer the exact name WebClass uses, so the saved entry matches future checks.
+    const state = await loadState(STATE_PATH);
+    const course =
+      resolveCourseInput(input, uniqueCourseNames(state.assignments)) ??
+      resolveCourseInput(input, mutedCourses);
+    if (!course) {
+      return '選択した授業が見つかりませんでした。もう一度候補から選んでください。';
+    }
+    const result = addMutedCourse(mutedCourses, course.name);
+    if (!result.changed) {
+      return `「${course.name}」は既にミュートしています。`;
+    }
+    await saveMutedCourses(MUTES_PATH, result.courses);
+
+    const unknownNote = course.known
+      ? ''
+      : '\n※ 現在の課題データにこの授業名はありません。WebClassの授業名と一致した場合に通知から除外されます。';
+    return `🔇 「${course.name}」の自動通知（新規課題・締切変更・24時間前・当日DM）をミュートしました。次回の自動巡回から適用されます。${unknownNote}`;
+  });
+  // Keep the queue usable even if this update fails.
+  muteUpdateQueue = update.catch(() => undefined);
+
+  await interaction.editReply(await update);
+}
+
+async function buildDataNote(state) {
+  const lines = [];
+  if (state.updatedAt) {
+    lines.push(`最終巡回: ${discordTime(state.updatedAt)}`);
+  }
+
+  const status = await loadRuntimeStatus(RUNTIME_STATUS_PATH);
+  if (status.consecutiveFailures > 0) {
+    lines.push(
+      `⚠️ 直近の自動巡回が${status.consecutiveFailures}回連続で失敗しているため、情報が古い可能性があります。`,
+    );
+  }
+  return lines.join('\n') || undefined;
+}
+
+async function respondWithAssignments(interaction, assignments, context) {
   if (
     interaction.commandName === 'webclass-next' ||
     interaction.commandName === 'webclass-closest'
@@ -142,7 +291,7 @@ async function respondWithAssignments(interaction, assignments) {
         ? '現在、未提出と判定できる課題はありません。'
         : '現在、提出期限を確認できる課題はありません。',
     );
-    await sendPagedEmbeds(interaction, embeds);
+    await sendPagedEmbeds(interaction, embeds, context);
     return;
   }
 
@@ -166,7 +315,7 @@ async function respondWithAssignments(interaction, assignments) {
       : '課題は見つかりませんでした。',
   );
 
-  await sendPagedEmbeds(interaction, embeds);
+  await sendPagedEmbeds(interaction, embeds, context);
 }
 
 async function buildStatusEmbed() {
@@ -224,12 +373,16 @@ function truncate(value, maxLength) {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 }
 
-async function sendPagedEmbeds(interaction, embeds) {
+async function sendPagedEmbeds(interaction, embeds, { ephemeral, content }) {
   const [firstEmbed, ...restEmbeds] = embeds;
-  await interaction.editReply({ embeds: [firstEmbed] });
+  await interaction.editReply({ content, embeds: [firstEmbed] });
 
+  // Follow-ups are public by default, so owner-only lists must stay ephemeral explicitly.
   for (const embed of restEmbeds) {
-    await interaction.followUp({ embeds: [embed] });
+    await interaction.followUp({
+      embeds: [embed],
+      ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {}),
+    });
   }
 }
 
