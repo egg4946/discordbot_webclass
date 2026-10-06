@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { basename, resolve, sep } from 'node:path';
 import { describeValues, questionFingerprint, validateAnswers } from './task-questions.js';
 import { acceptPageLeave, formatDeadline, openQuestionForm } from './task-fetch.js';
-import { answerDigest, FINISHED_STATUSES, readJson, readTask, readText, saveText, taskDir, taskPath, updateTask } from './task-store.js';
+import { answerDigest, FINISHED_STATUSES, readJson, readTask, readText, saveText, taskDir, taskPath, updateTask, withTaskLock } from './task-store.js';
 import { isReportQuestion, PROVIDERS } from './task-answer.js';
 import { reportFiles } from './task-report.js';
 import { openWebclassSession } from './webclass.js';
@@ -14,6 +14,10 @@ import { gotoTestPage, readPageInputs, restorePageInputs } from './task-paged.js
 // their evidence, plus the hash that approval must quote.
 export async function reviewTask(id) {
   const task = await readTask(id);
+  // A fetch-error task has no questions to review yet.
+  if (!Array.isArray(task.questions) || task.questions.length === 0) {
+    throw new Error('この課題には設問がありません。fetch をやり直してください。');
+  }
   const draft = await readJson(id, 'answer.json');
   const answers = validateAnswers(task.questions, draft.answers);
   const digest = answerDigest(answers, await fileDigests(id, task, answers));
@@ -81,21 +85,36 @@ export function conflictLabel(meta) {
 }
 
 export async function approveTask(id, digestPrefix) {
-  const { task, digest } = await reviewTask(id);
-  if (!digestPrefix || digestPrefix.length < 12 || !digest.startsWith(digestPrefix)) {
-    throw new Error('承認用ハッシュが一致しません。review で最新のハッシュを確認してください。');
-  }
-  if (FINISHED_STATUSES.includes(task.status)) {
-    throw new Error(`この課題は既に提出処理に入っています (status: ${task.status})。`);
-  }
-  await updateTask(id, { status: 'approved', approval: { digest, at: new Date().toISOString() } });
-  return { digest };
+  // Under the task lock, so a submission cannot start or end between the check and the write.
+  return withTaskLock(id, async () => {
+    const { task, digest } = await reviewTask(id);
+    if (!digestPrefix || digestPrefix.length < 12 || !digest.startsWith(digestPrefix)) {
+      throw new Error('承認用ハッシュが一致しません。review で最新のハッシュを確認してください。');
+    }
+    if (FINISHED_STATUSES.includes(task.status)) {
+      throw new Error(`この課題は既に提出処理に入っています (status: ${task.status})。`);
+    }
+    await updateTask(id, { status: 'approved', approval: { digest, at: new Date().toISOString() } });
+    return { digest };
+  });
 }
 
 // dryRun fills the form and takes a screenshot but never presses 採点, and leaving
 // the page without grading does not save the entered values.
 export async function submitTask(config, id, { dryRun = false, allowAttempt = false } = {}) {
+  // Two runs on the same form could both press 採点, and a fetch running meanwhile would write
+  // task.json from what it read before the submission, so every check below runs under the lock.
+  return withTaskLock(id, () => submitLocked(config, id, { dryRun, allowAttempt }));
+}
+
+async function submitLocked(config, id, { dryRun, allowAttempt }) {
   const task = await readTask(id);
+  if (FINISHED_STATUSES.includes(task.status)) {
+    throw new Error(`この課題は既に提出処理に入っています (status: ${task.status})。結果を確認してください。`);
+  }
+  if (!Array.isArray(task.questions) || task.questions.length === 0) {
+    throw new Error('この課題には設問がありません。fetch をやり直してください。');
+  }
   const draft = await readJson(id, 'answer.json');
   const answers = validateAnswers(task.questions, draft.answers);
   const digest = answerDigest(answers, await fileDigests(id, task, answers));
@@ -104,17 +123,14 @@ export async function submitTask(config, id, { dryRun = false, allowAttempt = fa
       throw new Error('現在の answer.json は承認されていません（提出するファイルの中身も含めて確認します）。review → approve を先に行ってください。');
     }
   }
-  if (FINISHED_STATUSES.includes(task.status)) {
-    throw new Error(`この課題は既に提出処理に入っています (status: ${task.status})。結果を確認してください。`);
-  }
   if (task.item.deadlineAt && Date.now() > new Date(task.item.deadlineAt).getTime()) {
     throw new Error('提出期限を過ぎています。');
   }
 
   const { browser, page } = await openWebclassSession(config);
-  acceptPageLeave(page);
-  await page.setViewportSize({ width: 1280, height: 900 });
   try {
+    acceptPageLeave(page);
+    await page.setViewportSize({ width: 1280, height: 900 });
     const { layout, frame, questions } = await openQuestionForm(page, task.item, { allowAttempt });
     if (questionFingerprint(questions) !== task.fingerprint) {
       throw new Error('取得時から設問が変わっています。fetch からやり直してください。');

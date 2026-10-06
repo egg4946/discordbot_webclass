@@ -1,9 +1,10 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import { loadConfig } from './config.js';
+import { loadTaskConfig } from './config.js';
 import { fetchAssignments } from './webclass.js';
 
 async function main() {
-  const config = loadConfig();
+  // Inspecting WebClass needs no Discord settings.
+  const config = loadTaskConfig();
   const assignments = await fetchAssignments(config, {
     onPage: ({ title, assignmentCount }) => {
       console.log(`[${assignmentCount}] ${title}`);

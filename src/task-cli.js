@@ -164,6 +164,8 @@ async function main() {
     }
     default:
       console.log(USAGE);
+      // An unknown command is an error; no command or help just shows the usage.
+      if (command && !['help', '--help', '-h'].includes(command)) process.exitCode = 1;
   }
 }
 

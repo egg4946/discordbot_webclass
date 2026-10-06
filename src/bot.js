@@ -99,20 +99,40 @@ async function main() {
   const config = loadConfig();
   initializeLogger('bot', config.logRetentionDays);
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+  // Resolved at startup; looked up again on demand if Discord could not be reached then.
   let ownerUserId = null;
+  const getOwnerUserId = async () => {
+    ownerUserId ??= await resolveDiscordOwnerUserId(config);
+    return ownerUserId;
+  };
+
+  // discord.js reports a rejected listener as an 'error' event, which would otherwise
+  // terminate the process.
+  client.on('error', (error) => {
+    console.error('Discord client error:', error);
+  });
 
   client.once('clientReady', async () => {
-    ownerUserId = await resolveDiscordOwnerUserId(config);
-    await registerCommands(client, config);
     console.log(`Logged in as ${client.user.tag}`);
-    console.log(`Commands: ${COMMANDS.map((command) => `/${command.name}`).join(', ')}`);
+    await getOwnerUserId().catch((error) => {
+      console.error('Could not resolve the bot owner; retrying on the next owner-only command:', error);
+    });
+    try {
+      await registerCommands(client, config);
+      console.log(`Commands: ${COMMANDS.map((command) => `/${command.name}`).join(', ')}`);
+    } catch (error) {
+      // Commands registered by an earlier start stay usable.
+      console.error('Failed to register slash commands:', error);
+    }
   });
 
   client.on('interactionCreate', async (interaction) => {
     if (interaction.isAutocomplete()) {
-      await respondToCourseAutocomplete(interaction, ownerUserId).catch((error) => {
-        console.error(error);
-      });
+      await getOwnerUserId()
+        .then((ownerUserId) => respondToCourseAutocomplete(interaction, ownerUserId))
+        .catch((error) => {
+          console.error(error);
+        });
       return;
     }
 
@@ -130,12 +150,12 @@ async function main() {
         : true;
     const ownerOnly = requiresOwner(interaction.commandName, includeSubmitted);
 
-    await interaction.deferReply(
-      ownerOnly ? { flags: MessageFlags.Ephemeral } : undefined,
-    );
-
     try {
-      if (ownerOnly && interaction.user.id !== ownerUserId) {
+      await interaction.deferReply(
+        ownerOnly ? { flags: MessageFlags.Ephemeral } : undefined,
+      );
+
+      if (ownerOnly && interaction.user.id !== (await getOwnerUserId())) {
         await interaction.editReply(
           'このコマンド（またはオプション）はBot所有者だけが使用できます。',
         );
@@ -170,9 +190,14 @@ async function main() {
       await respondWithAssignments(interaction, activeAssignments(state.assignments), context);
     } catch (error) {
       console.error(error);
-      await interaction.editReply(
-        '課題データの読み込み中にエラーが発生しました。しばらくしてから試してください。',
-      );
+      // An expired or unknown interaction cannot be answered at all.
+      if (interaction.deferred || interaction.replied) {
+        await interaction
+          .editReply('課題データの読み込み中にエラーが発生しました。しばらくしてから試してください。')
+          .catch((replyError) => {
+            console.error('Failed to send the error reply:', replyError);
+          });
+      }
     }
   });
 

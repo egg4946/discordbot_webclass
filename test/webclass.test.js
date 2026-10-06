@@ -150,6 +150,121 @@ test('table rows with a plain-text title cell are detected', () => {
   assert.equal(assignments[0].title, '第3回レポート');
 });
 
+test('a report whose title ends with a UI word such as 作成 is kept', () => {
+  const assignments = extractAssignments(
+    page([
+      content({
+        title: '期末レポート作成',
+        category: 'レポート',
+        kind: 'content-kind-report',
+        id: 'final-report',
+      }),
+    ]),
+    PAGE_URL,
+  );
+
+  assert.equal(assignments.length, 1);
+  assert.equal(assignments[0].title, '期末レポート作成');
+});
+
+// Same structure as a real WebClass list item: the attributes sit on the section, the
+// period text inside div.cl-contentsList_content, and data-end-date ends at :59 seconds.
+const REAL_END_DATE = '1790261999'; // 2026/09/24 23:59:59 JST
+const REAL_NOW = new Date('2026-09-20T00:00:00Z');
+
+// `actions` follows the content block, `inside` ends it, `inDetail` joins the 詳細 link and
+// `inInfo` ends the title/category/period block: the places an operation link could take.
+function listItem({ name, id, execCount, actions = '', inside = '', inDetail = '', inInfo = '', status = '',
+  endDate = REAL_END_DATE, period = '2026/09/17 15:30 - 2026/09/24 23:59' }) {
+  return `
+    <section data-contents-id="${id}" data-contents-name="${name}" data-end-date="${endDate}" data-exec-count="${execCount}" class="list-group-item cl-contentsList_listGroupItem">
+      <div class="cl-contentsList_content">
+        <div class="cl-contentsList_contentInfo">
+          <h4 class="cm-contentsList_contentName">
+            <a href="/webclass/do_contents.php?reset_status=1&amp;set_contents_id=${id}">${name}</a>
+          </h4>
+          <div class="cl-contentsList_categoryLabel">レポート</div>
+          ${period ? `<div class="cm-contentsList_contentDetailListItem">
+            <div class="cm-contentsList_contentDetailListItemLabel">利用可能期間</div>
+            <div class="cm-contentsList_contentDetailListItemData">${period}</div>
+          </div>` : ''}
+          ${status ? `<div>${status}</div>` : ''}
+          ${inInfo}
+        </div>
+        <div class="cl-contentsList_contentDetail">
+          <a href="/webclass/course.php/example/contents/${id}/">詳細</a>
+          ${execCount > 0 ? `<div>利用回数 ${execCount}</div>` : ''}
+          ${inDetail}
+        </div>
+        ${inside}
+      </div>
+      ${actions}
+    </section>
+  `;
+}
+
+test('real list items give one assignment each with the status from data-exec-count', () => {
+  const assignments = extractAssignments(
+    page([
+      listItem({ name: '第1回レポート', id: 'not-opened', execCount: 0 }),
+      listItem({ name: '第2回レポート', id: 'opened', execCount: 1 }),
+    ]),
+    PAGE_URL,
+    REAL_NOW,
+  );
+  const bySourceId = Object.fromEntries(assignments.map((item) => [item.sourceId, item]));
+
+  assert.equal(assignments.length, 2);
+  assert.equal(bySourceId['not-opened'].status, '未提出');
+  assert.equal(bySourceId.opened.status, null);
+  // Floored to the minute so deadlines saved before this change compare as unchanged.
+  assert.equal(bySourceId['not-opened'].deadlineAt, '2026-09-24T14:59:00.000Z');
+});
+
+test('status words inside the title do not override data-exec-count', () => {
+  const [item] = extractAssignments(
+    page([listItem({ name: '授業終了後レポート', id: 'after-class', execCount: 0 })]),
+    PAGE_URL,
+    REAL_NOW,
+  );
+
+  assert.equal(item.status, '未提出');
+});
+
+// WebClass may show operation links such as マイレポート in a list item. Wherever they sit, the
+// item text then ends with a UI word, although the content itself is an assignment.
+test('operation links anywhere in a list item keep the assignment and its fields', () => {
+  const link = (label) => `<div class="cl-contentsList_contentDetailListItem"><a href="/webclass/course.php/example/my-reports">${label}</a></div>`;
+  for (const label of ['マイレポート', 'テスト結果']) {
+    for (const place of ['actions', 'inside', 'inDetail', 'inInfo']) {
+      const extract = (fields) => extractAssignments(page([listItem({ name: '第3回レポート', id: 'with-link', execCount: 0, [place]: link(label), ...fields })]), PAGE_URL, REAL_NOW);
+      const where = `${label} ${place}`;
+      const [unsubmitted, ...rest] = extract({});
+      assert.equal(rest.length, 0, where);
+      assert.equal(unsubmitted?.title, '第3回レポート', where);
+      assert.equal(unsubmitted.status, '未提出', where);
+      assert.equal(unsubmitted.deadlineAt, '2026-09-24T14:59:00.000Z', where);
+      assert.equal(extract({ execCount: 1, status: '提出済' })[0]?.status, '提出済', where);
+      // Without a deadline nothing is notified, link or not.
+      assert.deepEqual(extract({ endDate: '0', period: '' }), [], where);
+    }
+  }
+});
+
+test('titles that contain an operation word are assignments, a bare operation label is not', () => {
+  const titles = ['第2回 テスト結果の分析レポート', 'マイレポートの使い方に関するレポート', '期末レポート作成'];
+  const assignments = extractAssignments(
+    page([
+      ...titles.map((name, index) => listItem({ name, id: `similar-${index}`, execCount: 0 })),
+      listItem({ name: 'マイレポート', id: 'bare-label', execCount: 0 }),
+    ]),
+    PAGE_URL,
+    REAL_NOW,
+  );
+
+  assert.deepEqual(assignments.map((item) => item.title).sort(), [...titles].sort());
+});
+
 function textDeadlinePage(deadline) {
   return page([
     `<div class="cl-contentsList_listGroupItem content-kind-report">

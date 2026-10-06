@@ -34,9 +34,9 @@ export async function fetchAssignments(config, options = {}) {
 // so callers can avoid treating a partial result as the complete list.
 export async function fetchAssignmentSnapshot(config, options = {}) {
   const browser = await chromium.launch({ headless: config.headless });
-  const page = await browser.newPage({ locale: 'ja-JP', timezoneId: 'Asia/Tokyo' });
 
   try {
+    const page = await browser.newPage({ locale: 'ja-JP', timezoneId: 'Asia/Tokyo' });
     await gotoWebclassPage(page, config.webclassLoginUrl);
     if (await hasFirstVisible(page, PASSWORD_SELECTORS)) {
       await fillFirstVisible(page, USERNAME_SELECTORS, config.webclassUserId);
@@ -140,7 +140,18 @@ export async function isWebclassLoginPage(page) {
 }
 
 export async function gotoWebclassPage(page, url) {
-  await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
+  try {
+    await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
+  } catch (error) {
+    // A failed earlier goto leaves its error page or redirect still loading, and that
+    // navigation interrupts this one. Retrying once after it settles keeps one bad page
+    // from making every later page fail as well.
+    if (!/interrupted by another navigation/.test(error.message)) {
+      throw error;
+    }
+    await page.waitForLoadState('load', { timeout: 15000 }).catch(() => undefined);
+    await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
+  }
   await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => undefined);
   await page.waitForTimeout(1200);
 }
@@ -310,7 +321,7 @@ export function extractAssignments(html, pageUrl, now = new Date()) {
     const title = pickTitle($, element);
     const deadlineText = pickDeadline($, element, text);
     const deadlineAt = pickDeadlineAt($, element, deadlineText, now);
-    const status = pickStatus($, element, text);
+    const status = pickStatus($, element, text, title);
     if (!courseName || !deadlineText || isBadAssignmentTitle(title) || isExpired(deadlineAt, now)) {
       continue;
     }
@@ -372,11 +383,15 @@ function collectCandidateElements($) {
   return Array.from(elements);
 }
 
+// The list item itself carries data-end-date and data-exec-count. closest() would return
+// the inner .cl-contentsList_content div, which has neither, so the list item comes first.
 function canonicalCandidateElement($, element) {
   return (
+    $(element).closest('.cl-contentsList_listGroupItem')[0] ??
     $(element).closest(
       '.cl-contentsList_listGroupItem, .cm-contentsList_content, .cl-contentsList_content, .list-group-item, tr, li',
-    )[0] ?? element
+    )[0] ??
+    element
   );
 }
 
@@ -405,7 +420,10 @@ function isProbableAssignmentElement($, element, text) {
   if (text.length < 4 || text.length > 1500) {
     return false;
   }
-  if (isNavigationOrUiText(text)) {
+  // A WebClass content item names its parts: its title and category decide below, and its links
+  // (詳細, マイレポート, テスト結果, ...) are operation UI wherever they sit. Only other candidates
+  // are dropped for text that ends like a navigation or UI label.
+  if (!isWebclassContentItem($, element) && isNavigationOrUiText(text)) {
     return false;
   }
 
@@ -428,13 +446,20 @@ function isProbableAssignmentElement($, element, text) {
     category === '自習' || /content-kind-selfstudy/i.test(className);
   const taskGroup = /(課題|テスト)/.test(findGroupContext($, element));
   const hasDeadline = Boolean(pickDeadline($, element, text));
-  const hasUsefulTitle = title.length >= 2 && !isNavigationOrUiText(title);
+  const hasUsefulTitle = title.length >= 2 && !isNavigationOrUiLabel(title);
   const hasExplicitTaskTitle = /(課題|レポート|小テスト|テスト|試験)/.test(title);
 
   const fallbackTaskEvidence =
     !category && taskGroup && /(レポート|自習|課題|小テスト|テスト|試験)/.test(evidenceText);
   const requiredSelfStudy = selfStudyKind && hasExplicitTaskTitle;
   return hasUsefulTitle && hasDeadline && (knownTaskKind || requiredSelfStudy || fallbackTaskEvidence);
+}
+
+function isWebclassContentItem($, element) {
+  return (
+    $(element).find('.cm-contentsList_contentName').length > 0 &&
+    $(element).find('.cl-contentsList_categoryLabel').length > 0
+  );
 }
 
 function isBadAssignmentTitle(title) {
@@ -450,10 +475,18 @@ function isBadAssignmentTitle(title) {
   );
 }
 
+const NAVIGATION_OR_UI_WORDS =
+  'ログアウト|コースリスト|アカウント|マニュアル|FAQ|タイムライン|ラベル一覧|教材がありません|さらに過去|もっと見る|送信|成績|出席|ノート|開講情報|アクセスログ|作成|削除された教材|既存の教材を公開|SCORMの成績一覧|テスト結果|マイレポート';
+const NAVIGATION_OR_UI_SUFFIX = new RegExp(`(?:${NAVIGATION_OR_UI_WORDS})$`);
+const NAVIGATION_OR_UI_LABEL = new RegExp(`^(?:${NAVIGATION_OR_UI_WORDS})$`);
+
 function isNavigationOrUiText(text) {
-  return /(?:ログアウト|コースリスト|アカウント|マニュアル|FAQ|タイムライン|ラベル一覧|教材がありません|さらに過去|もっと見る|送信|成績|出席|ノート|開講情報|アクセスログ|作成|削除された教材|既存の教材を公開|SCORMの成績一覧|テスト結果|マイレポート)$/.test(
-    text,
-  );
+  return NAVIGATION_OR_UI_SUFFIX.test(text);
+}
+
+// A title is UI text only when it is the whole label, so "期末レポート作成" stays a title.
+function isNavigationOrUiLabel(title) {
+  return NAVIGATION_OR_UI_LABEL.test(title);
 }
 
 function findGroupContext($, element) {
@@ -516,9 +549,9 @@ function stripNewBadge(value) {
 }
 
 function pickDeadline($, element, text) {
-  const endDate = Number($(element).attr('data-end-date'));
-  if (Number.isFinite(endDate) && endDate > 0) {
-    return formatLocalDeadline(new Date(endDate * 1000));
+  const endDate = attributeEndDate($, element);
+  if (endDate) {
+    return formatLocalDeadline(endDate);
   }
 
   const patterns = [
@@ -539,11 +572,20 @@ function pickDeadline($, element, text) {
 }
 
 function pickDeadlineAt($, element, deadlineText, now) {
-  const endDate = Number($(element).attr('data-end-date'));
-  if (Number.isFinite(endDate) && endDate > 0) {
-    return new Date(endDate * 1000).toISOString();
+  const endDate = attributeEndDate($, element);
+  if (endDate) {
+    return endDate.toISOString();
   }
   return parseDeadline(deadlineText, now);
+}
+
+// WebClass ends a period at hh:mm:59. Flooring to the minute keeps deadlineAt equal to the
+// text-derived value that earlier versions saved, so an update reports no deadline change.
+function attributeEndDate($, element) {
+  const endDate = Number($(element).attr('data-end-date'));
+  return Number.isFinite(endDate) && endDate > 0
+    ? new Date(Math.floor(endDate / 60) * 60 * 1000)
+    : null;
 }
 
 function parseDeadline(value, now = new Date()) {
@@ -615,8 +657,10 @@ function isExpired(deadlineAt, now) {
   return Number.isNaN(deadline.getTime()) || deadline.getTime() < now.getTime();
 }
 
-function pickStatus($, element, text) {
-  const match = text.match(/(未提出|提出済|受付中|終了|未受験|受験済)/);
+function pickStatus($, element, text, title) {
+  // Words in the title such as "授業終了後レポート" say nothing about the submission.
+  const statusText = title ? text.split(title).join(' ') : text;
+  const match = statusText.match(/(未提出|提出済|受付中|終了|未受験|受験済)/);
   if (match) {
     return match[1];
   }

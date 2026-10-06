@@ -9,7 +9,7 @@ import { PROVIDERS, isReportQuestion } from './task-answer.js';
 import { ATTEMPT_CATEGORIES } from './task-fetch.js';
 import { describeValues, validateAnswers } from './task-questions.js';
 import { reportFiles } from './task-report.js';
-import { FINISHED_STATUSES, TASK_ROOT, readJson, readTask, readText, saveJson, saveText, taskDir, taskPath, updateTask } from './task-store.js';
+import { FINISHED_STATUSES, TASK_ROOT, readJson, readTask, readText, saveJson, saveText, taskDir, taskPath, updateTask, writeUnsubmitted } from './task-store.js';
 import { approveTask, reviewTask } from './task-submit.js';
 import { parseGradeResults } from './task-retry.js';
 
@@ -36,12 +36,15 @@ const UNCANCELLABLE = ['submit'];
 // sends can turn into an extra command line flag.
 export function commandArgs(action, params = {}) {
   const id = () => {
-    if (!TASK_ID.test(String(params.id ?? ''))) throw new Error('task-id が正しくありません。');
-    return params.id;
+    const value = String(params.id ?? '');
+    if (!TASK_ID.test(value)) throw new Error('task-id が正しくありません。');
+    // Return the checked string: an array id would pass String() but break the job lock.
+    return value;
   };
   const contentsId = () => {
-    if (!/^[a-f0-9]{32}$/.test(String(params.contentsId ?? ''))) throw new Error('課題のIDが正しくありません。');
-    return params.contentsId;
+    const value = String(params.contentsId ?? '');
+    if (!/^[a-f0-9]{32}$/.test(value)) throw new Error('課題のIDが正しくありません。');
+    return value;
   };
   const numbers = () => (params.questions ?? []).map((value) => {
     if (!Number.isInteger(Number(value)) || Number(value) <= 0) throw new Error('設問番号が正しくありません。');
@@ -230,7 +233,7 @@ async function buildDetail(id) {
 
   const files = await readdir(taskDir(id)).catch(() => []);
   const receipt = files.includes('submission-receipt.txt')
-    ? (await readText(id, 'submission-receipt.txt').catch(() => '')).slice(0, 20000)
+    ? await readText(id, 'submission-receipt.txt').catch(() => '')
     : null;
   return {
     task: { ...task, questions: undefined },
@@ -240,7 +243,8 @@ async function buildDetail(id) {
     digest,
     reviewError,
     screenshots: files.filter((name) => /\.png$/.test(name)).sort(),
-    receipt,
+    // Only the displayed copy is cut; grades are parsed from the full text below.
+    receipt: receipt?.slice(0, 20000) ?? null,
     // The grade table of this submission, or of the previous one while a retry is being prepared.
     grades: receipt ? parseGradeResults(receipt) : (task.attempts?.at(-1)?.results ?? []),
     solverErrors: Object.fromEntries(PROVIDERS.map((provider) => [provider, solvers[provider] ? null : 'まだ実行していません'])),
@@ -277,7 +281,7 @@ export function createTaskServer({ token = randomBytes(24).toString('hex'), port
     job = {
       action,
       label: JOB_LABELS[action] ?? action,
-      taskId: TASK_ID.test(String(params?.id ?? '')) ? params.id : null,
+      taskId: TASK_ID.test(String(params?.id ?? '')) ? String(params.id) : null,
       command: `npm run task -- ${args.join(' ')}`,
       startedAt: new Date().toISOString(),
       finishedAt: null,
@@ -368,11 +372,14 @@ export function createTaskServer({ token = randomBytes(24).toString('hex'), port
     }
 
     if (method === 'GET' && path === '/api/state') {
+      // Read before the tasks: a job shown as ended here wrote everything before it ended, so
+      // the screen can take this state as containing that job's results.
+      const current = jobView();
       const contents = await readFile(CONTENTS_CACHE, 'utf8').then(JSON.parse).catch(() => null);
       return send(response, 200, {
         tasks: await readTasks(),
         contents,
-        job: jobView(),
+        job: current,
         attemptCategories: ATTEMPT_CATEGORIES,
         providers: PROVIDERS,
         taskRoot: TASK_ROOT,
@@ -423,25 +430,36 @@ export function createTaskServer({ token = randomBytes(24).toString('hex'), port
         return send(response, 200, { names: names.filter((name) => SERVABLE[extname(name).toLowerCase()]).sort() });
       }
 
+      // Only the request is read before the task lock. Everything the save is computed from
+      // (task.json, answer.json) is read under the lock, so a save or submit that finished while
+      // this request was arriving is built on, never overwritten with an older copy.
       if (method === 'PUT' && section === '/answer') {
-        const task = await requireEditable(id);
-        const draft = await readJson(id, 'answer.json').catch(() => ({ providers: [], answers: [], notes: '' }));
-        const next = applyAnswerEdits(task.questions ?? [], draft, (await readBody(request)).answers);
-        await saveJson(id, 'answer.json', next);
-        await updateTask(id, { status: 'answered', approval: null });
+        await requireEditable(id);
+        const { answers: edits } = await readBody(request);
+        assertNoJob(id);
+        await writeUnsubmitted(id, '解答は変更できません。', async () => {
+          const task = await readTask(id);
+          const draft = await readJson(id, 'answer.json').catch(() => ({ providers: [], answers: [], notes: '' }));
+          await saveJson(id, 'answer.json', applyAnswerEdits(task.questions ?? [], draft, edits));
+          await updateTask(id, { status: 'answered', approval: null });
+        });
         return send(response, 200, await buildDetail(id));
       }
 
       if (method === 'PUT' && section === '/report') {
-        const task = await requireEditable(id);
-        const question = (task.questions ?? []).find((item) => item.number === Number(number));
-        if (!question || !isReportQuestion(question)) throw new Error(`設問${number} はレポート提出の設問ではありません。`);
+        await requireEditable(id);
         const markdown = String((await readBody(request)).markdown ?? '');
         if (!markdown.trim()) throw new Error('レポート本文が空です。');
-        await saveText(id, reportFiles(question.number).markdown, markdown);
+        assertNoJob(id);
         // The PDF is now older than the Markdown, so the approval no longer matches what
         // would be uploaded. `render` rebuilds it.
-        await updateTask(id, { approval: null });
+        await writeUnsubmitted(id, 'レポートは変更できません。', async () => {
+          const task = await readTask(id);
+          const question = (task.questions ?? []).find((item) => item.number === Number(number));
+          if (!question || !isReportQuestion(question)) throw new Error(`設問${number} はレポート提出の設問ではありません。`);
+          await saveText(id, reportFiles(question.number).markdown, markdown);
+          await updateTask(id, { status: 'answered', approval: null });
+        });
         return send(response, 200, await buildDetail(id));
       }
 
