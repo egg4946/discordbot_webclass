@@ -6,7 +6,7 @@ import { extractAttachmentText } from './task-extract.js';
 import { parseQuestionForm, questionFingerprint, renderQuestions } from './task-questions.js';
 import { collectPagedQuestions, findAnswerFrame } from './task-paged.js';
 import { pageName, renderPdfPages } from './task-render.js';
-import { readSubmittedTask, saveJson, saveTask, saveText, taskDir, taskId } from './task-store.js';
+import { FINISHED_STATUSES, readSubmittedTask, readTask, saveJson, saveTask, saveText, taskDir, taskId, withTaskLock } from './task-store.js';
 
 const ORIGIN = 'https://webclass.nanzan-u.ac.jp';
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
@@ -82,9 +82,13 @@ export function selectContent(contents, query) {
   const trimmed = String(query ?? '').trim();
   if (!trimmed) throw new Error('課題を指定してください。');
   const exactId = trimmed.match(/[a-f0-9]{32}/)?.[0];
+  // `list` shows the 16-hex task id, so that is accepted as well.
+  const shortId = !exactId && /^[a-f0-9]{16}$/.test(trimmed) ? trimmed : null;
   const candidates = contents.filter((item) => !isMaterial(item));
   const matches = exactId
     ? candidates.filter((item) => item.contentsId === exactId)
+    : shortId
+    ? candidates.filter((item) => taskId(item.contentsId) === shortId)
     : candidates.filter((item) => {
       const haystack = searchable(`${item.courseName} ${item.title}`);
       return searchable(trimmed).split(' ').every((word) => haystack.includes(word));
@@ -96,81 +100,108 @@ export function selectContent(contents, query) {
   return matches[0];
 }
 
+// `openSession` stands in for the WebClass login in tests.
 export async function fetchTask(config, query, options = {}) {
-  const { browser, page } = await openWebclassSession(config);
+  if (!String(query ?? '').trim()) throw new Error('課題を指定してください。');
+  const { browser, page } = await (options.openSession ?? openWebclassSession)(config);
   acceptPageLeave(page);
   try {
     const contents = await collectContents(page);
     const item = selectContent(contents, query);
+    // Checked before anything is saved, so a refused fetch leaves the task as it was.
+    assertAttemptAllowed(item, options.allowAttempt);
     const id = taskId(item.contentsId);
-    // Re-fetching replaces task.json, which would drop the record of a submission and make the
-    // task answerable (and submittable) again, so it has to be asked for explicitly. What is
-    // known about the earlier submission is kept.
-    const submitted = await readSubmittedTask(id);
-    if (submitted && !options.force) {
-      throw new Error(`この課題は既に提出処理に入っています (status: ${submitted.status})。`
-        + '結果を確認してください。取り直す場合は --force を付けてください（提出済みの記録は残ります）。');
-    }
-    const base = {
-      id,
-      item,
-      fetchedAt: new Date().toISOString(),
-      ...(submitted && { previousSubmission: {
-        status: submitted.status,
-        submittedAt: submitted.submittedAt ?? null,
-        submissionAttemptedAt: submitted.submissionAttemptedAt ?? null,
-        approval: submitted.approval ?? null,
-      } }),
-    };
-
-    try {
-      const materials = options.materials === false
-        ? []
-        : await fetchMaterials(page, id, pickMaterials(contents, item, options.materialQueries ?? []));
-      const { questions, html, pages } = await openQuestionForm(page, item, { allowAttempt: options.allowAttempt });
-      if (pages) {
-        for (const current of pages) {
-          await saveText(id, `question-p${current.number}.html`, current.answerHtml);
-          await saveText(id, `question-p${current.number}-text.html`, current.questionHtml);
-        }
-      } else {
-        await saveText(id, 'question.html', html);
-      }
-
-      const materialList = materials.map((material) => [
-        `- ${material.textFile}（${material.title}${material.readable ? '' : '、文字を読み取れませんでした'}）`,
-        ...material.images.map((directory) => `  - ページ画像: ${directory}（図・グラフ・表はこちらで確認）`),
-      ].join('\n'));
-      await saveText(id, 'questions.md', [
-        `# ${item.courseName} / ${item.title}`,
-        `期限: ${formatDeadline(item.deadlineAt)}`,
-        ...(pages ? [`形式: 1ページずつ表示されるテスト（全${pages.length}ページ）`] : []),
-        '',
-        renderQuestions(questions),
-        '',
-        '# 資料',
-        materialList.length ? materialList.join('\n') : '（取得した資料はありません）',
-        '',
-      ].join('\n'));
-
-      const task = {
-        ...base,
-        status: 'fetched',
-        questions,
-        fingerprint: questionFingerprint(questions),
-        layout: pages ? 'paged' : 'single',
-        materials,
-        unsupported: questions.filter((question) => !question.supported).map((question) => question.number),
-      };
-      await saveTask(id, task);
-      return task;
-    } catch (error) {
-      const pages = await savePageFrames(page, id);
-      await saveTask(id, { ...base, status: 'fetch-error', error: error.message, pages });
-      throw error;
-    }
+    // Held until task.json is written: a submit running meanwhile would be overwritten by what
+    // is read at the start, and both would have the same form open on WebClass.
+    return await withTaskLock(id, () => fetchLocked(page, contents, item, id, options));
   } finally {
     await browser.close();
+  }
+}
+
+async function fetchLocked(page, contents, item, id, options) {
+  const previous = await readTask(id).catch(() => null);
+  // Re-fetching replaces task.json, which would drop the record of a submission and make the
+  // task answerable (and submittable) again, so it has to be asked for explicitly. What is
+  // known about the earlier submission is kept.
+  const submitted = await readSubmittedTask(id);
+  if (submitted && !options.force) {
+    throw new Error(`この課題は既に提出処理に入っています (status: ${submitted.status})。`
+      + '結果を確認してください。取り直す場合は --force を付けてください（提出済みの記録は残ります）。');
+  }
+  const base = {
+    id,
+    item,
+    fetchedAt: new Date().toISOString(),
+    // Earlier submissions archived by retry stay, so the next retry numbers its attempt correctly.
+    ...(previous?.attempts && { attempts: previous.attempts }),
+    ...(submitted && { previousSubmission: {
+      status: submitted.status,
+      submittedAt: submitted.submittedAt ?? null,
+      submissionAttemptedAt: submitted.submissionAttemptedAt ?? null,
+      approval: submitted.approval ?? null,
+    } }),
+  };
+
+  try {
+    const materials = options.materials === false
+      ? []
+      : await fetchMaterials(page, id, pickMaterials(contents, item, options.materialQueries ?? []));
+    const { questions, html, pages } = await openQuestionForm(page, item, { allowAttempt: options.allowAttempt });
+    if (pages) {
+      for (const current of pages) {
+        await saveText(id, `question-p${current.number}.html`, current.answerHtml);
+        await saveText(id, `question-p${current.number}-text.html`, current.questionHtml);
+      }
+    } else {
+      await saveText(id, 'question.html', html);
+    }
+
+    const materialList = materials.map((material) => [
+      `- ${material.textFile}（${material.title}${material.readable ? '' : '、文字を読み取れませんでした'}）`,
+      ...material.images.map((directory) => `  - ページ画像: ${directory}（図・グラフ・表はこちらで確認）`),
+    ].join('\n'));
+    await saveText(id, 'questions.md', [
+      `# ${item.courseName} / ${item.title}`,
+      `期限: ${formatDeadline(item.deadlineAt)}`,
+      ...(pages ? [`形式: 1ページずつ表示されるテスト（全${pages.length}ページ）`] : []),
+      '',
+      renderQuestions(questions),
+      '',
+      '# 資料',
+      materialList.length ? materialList.join('\n') : '（取得した資料はありません）',
+      '',
+    ].join('\n'));
+
+    const task = {
+      ...base,
+      status: 'fetched',
+      questions,
+      fingerprint: questionFingerprint(questions),
+      layout: pages ? 'paged' : 'single',
+      materials,
+      unsupported: questions.filter((question) => !question.supported).map((question) => question.number),
+    };
+    // Anything outside the lock (an older copy of this program) could still have recorded a
+    // submission since `previous` was read; that record wins over this fetch.
+    const current = await readTask(id).catch(() => null);
+    if (current && FINISHED_STATUSES.includes(current.status) && JSON.stringify(current) !== JSON.stringify(previous)) {
+      throw new Error(`取得中にこの課題の提出が記録されました (status: ${current.status})。取得した内容は保存していません。`);
+    }
+    await saveTask(id, task);
+    return task;
+  } catch (error) {
+    const pages = await savePageFrames(page, id);
+    // Merged into task.json as it is now, not as it was read at the start, so a failed
+    // re-fetch never takes back a later change, nor wipes questions, approval or retry state.
+    const current = await readTask(id).catch(() => null);
+    const keep = current && (FINISHED_STATUSES.includes(current.status) || (Array.isArray(current.questions) && current.questions.length));
+    if (keep) {
+      await saveTask(id, { ...current, lastFetchError: { error: error.message, at: new Date().toISOString(), pages } });
+    } else {
+      await saveTask(id, { ...base, status: 'fetch-error', error: error.message, pages });
+    }
+    throw error;
   }
 }
 
@@ -179,9 +210,7 @@ export async function fetchTask(config, query, options = {}) {
 // Paged tests (layout 'paged'): every page is visited once, which saves each page as it
 // was (nothing is filled in here); nothing is graded until 終了 is pressed.
 export async function openQuestionForm(page, item, { allowAttempt = false } = {}) {
-  if (ATTEMPT_CATEGORIES.includes(item.category) && !allowAttempt) {
-    throw new Error(`「${item.category}」は開始すると受験回数や制限時間を消費する可能性があります。確認のうえ --allow-attempt を付けて実行してください。`);
-  }
+  assertAttemptAllowed(item, allowAttempt);
   await gotoWebclassPage(page, courseEntryUrl(item.courseId));
   await gotoWebclassPage(page, contentUrl(item.contentsId));
   await page.waitForTimeout(1500);
@@ -220,6 +249,12 @@ export async function openQuestionForm(page, item, { allowAttempt = false } = {}
   await frame.waitForLoadState('domcontentloaded').catch(() => undefined);
   const html = await frame.content();
   return { layout: 'single', frame, html, questions: parseQuestionForm(html) };
+}
+
+function assertAttemptAllowed(item, allowAttempt) {
+  if (ATTEMPT_CATEGORIES.includes(item.category) && !allowAttempt) {
+    throw new Error(`「${item.category}」は開始すると受験回数や制限時間を消費する可能性があります。確認のうえ --allow-attempt を付けて実行してください。`);
+  }
 }
 
 export function acceptPageLeave(page) {
@@ -341,7 +376,9 @@ async function renderPdfImages(id, name, rawPath) {
     const { rendered, failed, totalPages } = await renderPdfPages(rawPath, join(taskDir(id), directory));
     if (rendered.length === 0) return '';
     const failedNote = failed.length ? `、画像にできなかったページ: ${failed.join(', ')}` : '';
-    return `\n（このPDFの各ページの画像: ${directory}/${pageName(1)} 〜 ${pageName(totalPages)}${failedNote}。`
+    const attempted = rendered.length + failed.length;
+    const capNote = attempted < totalPages ? `、全${totalPages}ページ中${attempted}ページまで` : '';
+    return `\n（このPDFの各ページの画像: ${directory}/${pageName(1)} 〜 ${pageName(rendered.at(-1))}${capNote}${failedNote}。`
       + '図・グラフ・表は下のテキストに含まれないため、必ず画像を開いて確認してください）';
   } catch (error) {
     console.warn(`PDFを画像にできませんでした (${name}): ${error.message}`);

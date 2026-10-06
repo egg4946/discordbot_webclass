@@ -1,11 +1,11 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AI_KINDS, sameValues, validateAnswers } from './task-questions.js';
 import { renderReportPdf, reportFiles } from './task-report.js';
-import { assertNotSubmitted, readJson, readTask, readText, saveJson, saveText, taskDir, taskPath, updateTask } from './task-store.js';
+import { assertNotSubmitted, readJson, readTask, readText, saveJson, saveText, taskDir, taskPath, updateTask, writeUnsubmitted } from './task-store.js';
 
 export const PROVIDERS = ['claude', 'codex'];
 const SOLVER_TIMEOUT_MS = 15 * 60 * 1000;
@@ -50,7 +50,8 @@ values の書き方（設問の [形式] に対応）:
 answers と reports を合わせて、すべての設問に答えてください。自信がない場合も最善の解答を入れ、confidence を low にしてください。`;
 
 export async function generateAnswers(id, providers, options = {}) {
-  await assertNotSubmitted(id, '結果を確認してください。作り直すには fetch --force で取り直します。');
+  const refused = '結果を確認してください。作り直すには fetch --force で取り直します。';
+  await assertNotSubmitted(id, refused);
   const task = await readTask(id);
   if (task.status === 'fetch-error' || !task.questions?.length) {
     throw new Error('設問が取得できていません。先に fetch を成功させてください。');
@@ -100,20 +101,39 @@ export async function generateAnswers(id, providers, options = {}) {
   if (succeeded.length === 0) {
     throw new Error(results.map((result) => `${result.provider}: ${result.error}`).join('\n'));
   }
-  const previousDraft = await readJson(id, 'answer.json').catch(() => null);
-  const existing = previousDraft?.answers ?? [];
-  let draft = mergeAnswers(targets, succeeded, options.prefer, existing);
-  if (only) {
-    const kept = existing.filter((answer) => !only.includes(Number(answer.question)));
-    draft = {
-      ...draft,
-      answers: [...kept, ...draft.answers].sort((left, right) => Number(left.question) - Number(right.question)),
-    };
-  }
-  await renderReports(id, task, draft, succeeded, options.prefer ?? 'claude', only);
-  await saveJson(id, 'answer.json', draft);
-  await updateTask(id, { status: 'answered', approval: null });
-  return { results, draft };
+  // The solvers took minutes; a submission that finished meanwhile must not be overwritten.
+  return writeUnsubmitted(id, refused, async () => {
+    // A failed solver's answers from an earlier run would be shown by review as current, although
+    // the merge below did not use them, so they are dropped (only the re-solved questions on retry).
+    for (const { provider } of results.filter((result) => result.error)) {
+      const stale = await readJson(id, `answer-${provider}.json`).catch(() => null);
+      if (stale && only) {
+        const keep = (item) => !only.includes(Number(item.question));
+        await saveJson(id, `answer-${provider}.json`, {
+          ...stale, answers: (stale.answers ?? []).filter(keep), reports: (stale.reports ?? []).filter(keep),
+        });
+      } else if (stale) {
+        await unlink(taskPath(id, `answer-${provider}.json`));
+      }
+      for (const question of reportQuestions) {
+        await unlink(taskPath(id, `report-${provider}-q${question.number}.md`)).catch(() => undefined);
+      }
+    }
+    const previousDraft = await readJson(id, 'answer.json').catch(() => null);
+    const existing = previousDraft?.answers ?? [];
+    let draft = mergeAnswers(targets, succeeded, options.prefer, existing);
+    if (only) {
+      const kept = existing.filter((answer) => !only.includes(Number(answer.question)));
+      draft = {
+        ...draft,
+        answers: [...kept, ...draft.answers].sort((left, right) => Number(left.question) - Number(right.question)),
+      };
+    }
+    await renderReports(id, task, draft, succeeded, options.prefer ?? 'claude', only);
+    await saveJson(id, 'answer.json', draft);
+    await updateTask(id, { status: 'answered', approval: null });
+    return { results, draft };
+  });
 }
 
 // Agreed answers are taken as-is; for disagreements the preferred provider's value
@@ -190,7 +210,11 @@ export async function renderReports(id, task, draft, results, prefer = 'claude',
 // Rebuilds the PDF from report-qN.md after the user edited it. Any approval is dropped,
 // because the file that would be uploaded changed.
 export async function renderReport(id, questionNumbers = []) {
-  await assertNotSubmitted(id, '提出するファイルは作り直せません。');
+  // Checked under the lock: the PDF is the file a submission uploads.
+  return writeUnsubmitted(id, '提出するファイルは作り直せません。', () => renderReportLocked(id, questionNumbers));
+}
+
+async function renderReportLocked(id, questionNumbers) {
   const task = await readTask(id);
   const wanted = questionNumbers.map(Number);
   const targets = task.questions
@@ -232,7 +256,12 @@ async function buildReport(id, task, question) {
 }
 
 export async function selectProvider(id, provider, questionNumbers = []) {
-  await assertNotSubmitted(id, '解答は差し替えられません。');
+  // Checked first: the name becomes part of a file path.
+  if (!PROVIDERS.includes(provider)) throw new Error('AIは claude / codex から選んでください。');
+  return writeUnsubmitted(id, '解答は差し替えられません。', () => selectProviderLocked(id, provider, questionNumbers));
+}
+
+async function selectProviderLocked(id, provider, questionNumbers) {
   const task = await readTask(id);
   const chosen = await readJson(id, `answer-${provider}.json`);
   const draft = await readJson(id, 'answer.json').catch(() => ({
@@ -240,6 +269,7 @@ export async function selectProvider(id, provider, questionNumbers = []) {
     answers: task.questions.map((question) => ({ question: question.number, values: [], source: 'none', conflict: true })),
     notes: '',
   }));
+  draft.providers ??= [];
   if (!draft.providers.includes(provider)) draft.providers.push(provider);
   const targets = questionNumbers.length ? questionNumbers.map(Number) : task.questions.map((question) => question.number);
   draft.answers = draft.answers.map((answer) => {

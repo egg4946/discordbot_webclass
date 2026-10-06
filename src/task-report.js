@@ -87,7 +87,7 @@ export function markdownToHtml(markdown) {
 
     const heading = line.match(/^(#{1,4})\s+(.*)$/);
     const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
-    const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    const numbered = line.match(/^\s*(\d+)[.)]\s+(.*)$/);
     const row = line.match(/^\s*\|(.*)\|\s*$/);
 
     if (!line.trim()) {
@@ -108,8 +108,18 @@ export function markdownToHtml(markdown) {
       flushParagraph();
       flushTable();
       const wanted = bullet ? 'ul' : 'ol';
-      if (list !== wanted) { flushList(); html.push(`<${wanted}>`); list = wanted; }
-      html.push(`<li>${inline((bullet ?? numbered)[1])}</li>`);
+      if (list !== wanted) {
+        flushList();
+        // A list split by a blank line continues its numbering instead of restarting at 1.
+        const start = numbered && Number(numbered[1]) !== 1 ? ` start="${Number(numbered[1])}"` : '';
+        html.push(`<${wanted}${start}>`);
+        list = wanted;
+      }
+      html.push(`<li>${inline(bullet ? bullet[1] : numbered[2])}</li>`);
+    } else if (list && /^\s+\S/.test(line)) {
+      // Indented continuation of the previous list item. A callback, so $& or $1 in the text
+      // is not read as a replacement pattern.
+      html.push(html.pop().replace(/<\/li>$/, () => ` ${inline(line.trim())}</li>`));
     } else {
       flushList();
       flushTable();

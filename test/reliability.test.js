@@ -1,11 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { discordRequest } from '../src/discord.js';
 import { fetchAssignmentsWithRetry } from '../src/fetch-with-retry.js';
 import { writeJsonFile } from '../src/json-file.js';
-import { acquireRunLock } from '../src/run-lock.js';
 import {
   markFailure,
   markSuccess,
@@ -47,43 +46,6 @@ test('throws after all retry attempts fail', async () => {
     /still failing/,
   );
   assert.equal(attempts, 2);
-});
-
-test('run lock prevents a second concurrent run', async () => {
-  const directory = join('test-results', `lock-${Date.now()}`);
-  const lockPath = join(directory, 'check.lock');
-  await mkdir(directory, { recursive: true });
-
-  try {
-    const release = await acquireRunLock(lockPath);
-    assert.equal(typeof release, 'function');
-    assert.equal(await acquireRunLock(lockPath), null);
-    await release();
-
-    const releaseAgain = await acquireRunLock(lockPath);
-    assert.equal(typeof releaseAgain, 'function');
-    await releaseAgain();
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('stale run locks are replaced', async () => {
-  const directory = join('test-results', `stale-lock-${Date.now()}`);
-  const lockPath = join(directory, 'check.lock');
-  await mkdir(directory, { recursive: true });
-  await writeFile(lockPath, 'stale', 'utf8');
-  // Backdate the lock explicitly; a fresh file's mtime can be slightly ahead of Date.now().
-  const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  await utimes(lockPath, anHourAgo, anHourAgo);
-
-  try {
-    const release = await acquireRunLock(lockPath, 60 * 1000);
-    assert.equal(typeof release, 'function');
-    await release();
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
 });
 
 test('runtime status counts failures and resets after success', () => {

@@ -3,7 +3,7 @@ import { copyFile, mkdir, readdir, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { generateAnswers, isReportQuestion, PROVIDERS } from './task-answer.js';
 import { describeValues, sameValues } from './task-questions.js';
-import { readJson, readTask, readText, saveJson, taskDir, taskPath, updateTask } from './task-store.js';
+import { readJson, readTask, readText, saveJson, taskDir, taskPath, updateTask, withTaskLock, writeUnsubmitted } from './task-store.js';
 
 // Files of one submission. Screenshots and the receipt are moved so the next submission's
 // files are not mistaken for them; the answers are copied because the retry starts from them.
@@ -13,25 +13,43 @@ const COPIED = /^(answer(-[a-z]+)?\.json|report-q\d+\.(md|pdf))$/;
 // Reads WebClass's grade table (reslt_menu.php) from submission-receipt.txt:
 //   問	解答	結果	得点/配点	解説	出題分野	コメント
 //   4	7, 9	×	0/2
+// innerText turns a <br> inside a cell into a newline, so a row can span several lines;
+// lines that do not start a new row are joined to the row until it has its score.
 export function parseGradeResults(receipt) {
   const lines = String(receipt ?? '').split(/\r?\n/);
   const start = lines.findIndex((line) => /^問\t解答\t結果\t得点\/配点/.test(line));
   if (start < 0) return [];
   const results = [];
+  let row = null;
+  const flush = () => {
+    const parsed = row && parseGradeRow(row);
+    if (parsed) results.push(parsed);
+    row = null;
+  };
   for (const line of lines.slice(start + 1)) {
     if (/成績を閉じる/.test(line) || line.startsWith('[http')) break;
-    const [number, answer, mark, score] = line.split('\t');
-    const points = score?.match(/^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/);
-    if (!/^\d+$/.test(number ?? '') || !points) continue;
-    results.push({
-      question: Number(number),
-      answer: (answer ?? '').trim(),
-      mark: (mark ?? '').trim(),
-      score: Number(points[1]),
-      max: Number(points[2]),
-    });
+    if (/^\d+\t/.test(line)) {
+      flush();
+      row = line;
+    } else if (row !== null && !parseGradeRow(row)) {
+      row += `\n${line}`;
+    }
   }
+  flush();
   return results;
+}
+
+function parseGradeRow(row) {
+  const [number, answer, mark, score] = row.split('\t');
+  const points = score?.match(/^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/);
+  if (!/^\d+$/.test(number ?? '') || !points) return null;
+  return {
+    question: Number(number),
+    answer: (answer ?? '').trim(),
+    mark: (mark ?? '').trim(),
+    score: Number(points[1]),
+    max: Number(points[2]),
+  };
 }
 
 export function wrongQuestions(results) {
@@ -68,6 +86,11 @@ export async function retryTask(id, { providers = PROVIDERS, questions = [], pre
   }
   const targets = requested.length ? requested : wrongQuestions(results);
   if (targets.length === 0) throw new Error('採点結果はすべて満点です。解き直す設問はありません。');
+  const ungraded = targets.filter((number) => !numbers.includes(number));
+  if (ungraded.length) {
+    throw new Error(`採点表の設問番号 ${ungraded.join(', ')} が取得した設問にありません。`
+      + 'WebClassで結果を確認し、解き直す設問番号を指定してください（例: retry <task-id> both 2 4）。');
+  }
 
   const draft = await readJson(id, 'answer.json');
   const previous = targets.map((number) => {
@@ -78,44 +101,51 @@ export async function retryTask(id, { providers = PROVIDERS, questions = [], pre
   });
 
   const attempt = (task.attempts?.length ?? 0) + 1;
-  await archiveAttempt(id, attempt);
-  await updateTask(id, {
-    status: 'answered',
-    approval: null,
-    submittedAt: null,
-    submissionAttemptedAt: null,
-    attempts: [...(task.attempts ?? []), {
-      number: attempt,
-      status: task.status,
-      submittedAt: task.submittedAt ?? null,
-      submissionAttemptedAt: task.submissionAttemptedAt ?? null,
-      approval: task.approval ?? null,
-      results,
-      folder: `attempts/${attempt}`,
-    }],
-    retry: { attempt: attempt + 1, questions: previous.map(({ question, values, describe, grade }) => ({ question, values, describe, grade })) },
-  });
-
-  // The solvers' answers to the retried questions were just marked wrong (copies stay in the
-  // archive); leaving them would show a failed solver's old answer as if it were a new one.
-  for (const provider of PROVIDERS) {
-    const solved = await readJson(id, `answer-${provider}.json`).catch(() => null);
-    if (!solved) continue;
-    const keep = (item) => !targets.includes(Number(item.question));
-    await saveJson(id, `answer-${provider}.json`, {
-      ...solved, answers: (solved.answers ?? []).filter(keep), reports: (solved.reports ?? []).filter(keep),
+  // The reset is the one write that takes a submitted task back to a draft, so it runs under
+  // the task lock and only while task.json is still what the checks above read.
+  await withTaskLock(id, async () => {
+    if (JSON.stringify(await readTask(id)) !== JSON.stringify(task)) {
+      throw new Error('確認中に課題の状態が変わりました。もう一度 retry を実行してください。');
+    }
+    await archiveAttempt(id, attempt);
+    await updateTask(id, {
+      status: 'answered',
+      approval: null,
+      submittedAt: null,
+      submissionAttemptedAt: null,
+      attempts: [...(task.attempts ?? []), {
+        number: attempt,
+        status: task.status,
+        submittedAt: task.submittedAt ?? null,
+        submissionAttemptedAt: task.submissionAttemptedAt ?? null,
+        approval: task.approval ?? null,
+        results,
+        folder: `attempts/${attempt}`,
+      }],
+      retry: { attempt: attempt + 1, questions: previous.map(({ question, values, describe, grade }) => ({ question, values, describe, grade })) },
     });
-  }
 
-  // Until a solver answers, the retried questions are flagged, so a failed run can never be
-  // approved with the answer that was just marked wrong without the review saying so.
-  await saveJson(id, 'answer.json', {
-    ...draft,
-    answers: draft.answers.map((answer) => {
-      if (targets.includes(Number(answer.question))) return { ...answer, source: 'wrong', conflict: true };
-      const full = results.some((result) => result.question === Number(answer.question) && result.score >= result.max);
-      return { ...answer, source: full ? 'correct' : answer.source };
-    }),
+    // The solvers' answers to the retried questions were just marked wrong (copies stay in the
+    // archive); leaving them would show a failed solver's old answer as if it were a new one.
+    for (const provider of PROVIDERS) {
+      const solved = await readJson(id, `answer-${provider}.json`).catch(() => null);
+      if (!solved) continue;
+      const keep = (item) => !targets.includes(Number(item.question));
+      await saveJson(id, `answer-${provider}.json`, {
+        ...solved, answers: (solved.answers ?? []).filter(keep), reports: (solved.reports ?? []).filter(keep),
+      });
+    }
+
+    // Until a solver answers, the retried questions are flagged, so a failed run can never be
+    // approved with the answer that was just marked wrong without the review saying so.
+    await saveJson(id, 'answer.json', {
+      ...draft,
+      answers: draft.answers.map((answer) => {
+        if (targets.includes(Number(answer.question))) return { ...answer, source: 'wrong', conflict: true };
+        const full = results.some((result) => result.question === Number(answer.question) && result.score >= result.max);
+        return { ...answer, source: full ? 'correct' : answer.source };
+      }),
+    });
   });
 
   return { ...await solveRetry(id, await readTask(id), { providers, prefer }), resumed: false };
@@ -147,8 +177,24 @@ async function solveRetry(id, task, { providers, prefer, questions = [] }) {
     }
   }
   if (repeated.length) {
-    await saveJson(id, 'answer.json', next);
-    await updateTask(id, { status: 'answered', approval: null });
+    // Checked again under the lock: the solvers took minutes, and the task may be submitted now.
+    // The flags go onto answer.json as it is now, not onto `next`: a save made since
+    // generateAnswers wrote it must not be undone, and an answer changed since is not flagged.
+    await writeUnsubmitted(id, '解き直しの結果は保存していません。', async () => {
+      const latest = await readJson(id, 'answer.json');
+      await saveJson(id, 'answer.json', {
+        ...latest,
+        answers: latest.answers.map((answer) => {
+          const number = Number(answer.question);
+          const before = previous.find((item) => item.question === number);
+          const question = task.questions.find((item) => item.number === number);
+          return repeated.includes(number) && sameValues(question, answer.values, before.values)
+            ? { ...answer, conflict: true, repeated: true }
+            : answer;
+        }),
+      });
+      await updateTask(id, { status: 'answered', approval: null });
+    });
   }
   return { attempt: task.retry.attempt, targets, previous, results: solverResults, draft: next, repeated };
 }

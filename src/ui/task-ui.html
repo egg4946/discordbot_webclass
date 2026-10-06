@@ -205,8 +205,16 @@ function toast(message, bad = false) {
   if (message) setTimeout(() => { if ($('toast').textContent === message) $('toast').textContent = ''; }, 6000);
 }
 
+// Answers can arrive out of order (a slow first load, a job's refresh and a click at once);
+// one that was asked for before the answer on screen is dropped, never drawn over it.
+let stateAsked = 0;
+let stateShown = 0;
 async function refreshState() {
-  state = await api('/api/state');
+  const asked = ++stateAsked;
+  const next = await api('/api/state');
+  if (asked < stateShown) return;
+  stateShown = asked;
+  state = next;
   drawJob(state.job);
   drawList();
   $('listedAt').textContent = state.contents
@@ -214,6 +222,7 @@ async function refreshState() {
     : '「一覧を更新」でWebClassから課題を読み込みます';
 }
 
+// Returns whether the task could be loaded.
 async function openTask(id) {
   selected = id;
   edits.clear();
@@ -225,9 +234,10 @@ async function openTask(id) {
   } catch (error) {
     detail = null;
     $('detail').replaceChildren(el('p', { className: 'err', textContent: error.message }));
-    return;
+    return false;
   }
   drawDetail();
+  return true;
 }
 
 /* ---------------------------------------------------------------- 課題一覧 */
@@ -242,6 +252,9 @@ function rows() {
   }
   for (const task of byId.values()) list.push({ id: task.id, item: task.item ?? {}, task });
   const words = filter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  // 締切順: earliest deadline first, no deadline last; sort() is stable for ties.
+  const due = (row) => Date.parse(row.item?.deadlineAt ?? '') || Infinity;
+  list.sort((a, b) => (due(a) === due(b) ? 0 : due(a) < due(b) ? -1 : 1));
   return list.filter((row) => {
     const hay = `${row.item?.courseName ?? ''} ${row.item?.title ?? ''}`.toLowerCase();
     return words.every((word) => hay.includes(word));
@@ -728,6 +741,7 @@ function gradesCard() {
   retry.onclick = () => {
     const questions = numbers.value.split(/[\s,、]+/).filter(Boolean);
     if (!questions.length) return toast('解き直す設問の番号を入れてください。', true);
+    const id = selected;
     modal({
       title: '間違えた設問を解き直しますか',
       lead: `設問${questions.join(', ')} だけをAIに解き直させます。ほかの設問は前回の解答のままです。`,
@@ -737,7 +751,8 @@ function gradesCard() {
         el('li', { textContent: '提出はしません。いつもどおり確認 → 承認 → 提出の順です。' }),
       ])],
       label: '解き直す',
-      action: async () => run('retry', { id: selected, provider: provider.value, questions }),
+      // The id is fixed now: the selection can change while the dialog is open.
+      action: async () => run('retry', { id, provider: provider.value, questions }),
     });
   };
   card.append(el('div', { className: 'bar' }, [el('span', { className: 'small dim', textContent: '解き直す設問:' }), numbers, provider, retry]));
@@ -745,6 +760,9 @@ function gradesCard() {
 }
 
 function confirmApprove() {
+  // Fixed when the dialog opens, so a task switched in the background is never approved.
+  const id = selected;
+  const { digest } = detail;
   const list = el('div');
   for (const question of detail.questions) {
     list.append(el('div', { style: 'margin-bottom:8px' }, [
@@ -758,7 +776,8 @@ function confirmApprove() {
     body: [list, el('div', { className: 'small' }, [el('span', { textContent: 'ハッシュ: ' }), el('code', { textContent: detail.digest.slice(0, 16) })])],
     label: '承認する',
     action: async () => {
-      detail = await api(`/api/task/${selected}/approve`, { method: 'POST', body: JSON.stringify({ digest: detail.digest }) });
+      const approved = await api(`/api/task/${id}/approve`, { method: 'POST', body: JSON.stringify({ digest }) });
+      if (selected === id) detail = approved;
       drawDetail();
       await refreshState();
       toast('承認しました。提出ボタンが押せます。');
@@ -767,6 +786,8 @@ function confirmApprove() {
 }
 
 function confirmSubmit(allowAttempt) {
+  // Fixed when the dialog opens, so a task switched in the background is never submitted.
+  const id = selected;
   modal({
     title: '本当に提出しますか',
     lead: 'WebClassの［採点］ボタンを押します。取り消せません。',
@@ -777,7 +798,7 @@ function confirmSubmit(allowAttempt) {
     ])],
     label: '提出する',
     danger: true,
-    action: async () => run('submit', { id: selected, allowAttempt }),
+    action: async () => run('submit', { id, allowAttempt }),
   });
 }
 
@@ -926,6 +947,14 @@ document.onkeydown = (event) => { if (event.key === 'Escape') $('veil').classLis
 /* ---------------------------------------------------------------- 起動 */
 
 const events = new EventSource(`/api/events?t=${TOKEN}`);
+// Every (re)connection first repeats the current job, which may have ended long ago, so the end
+// of a job is applied (state and open task reloaded) once, keyed by startedAt. `appliedJob`
+// changes only after both loads succeeded: a failed load is tried again when the end is
+// announced again (every reconnect repeats it). A reload after a later job's end shows the
+// earlier ends too, so only the newest applied end is kept. `applyingJob` keeps repeats that
+// arrive while it loads from loading it twice.
+let appliedJob; // startedAt of the newest job end on screen; first set from the first state load
+let applyingJob = null;
 events.onmessage = async (message) => {
   const event = JSON.parse(message.data);
   if (event.type === 'log') {
@@ -934,28 +963,54 @@ events.onmessage = async (message) => {
     return;
   }
   drawJob(event.job);
-  if (event.job && event.job.status !== 'running') {
-    await refreshState();
-    const target = event.job.taskId ?? (event.job.action === 'fetch' ? lastFetched(event.job) : null);
-    if (target && target !== selected) await openTask(target);
-    else if (selected) {
-      // openTask() clears `edits`, so a copy is kept to put the unsaved edits back.
-      const keep = new Map(edits);
-      await openTask(selected);
-      edits = keep;
-      drawDetail();
-    }
+  const ended = event.job && event.job.status !== 'running' ? event.job.startedAt : null;
+  if (ended === null) return;
+  // Whichever arrives first, the first state load decides whether this end is already in it.
+  await firstLoad;
+  if (ended === applyingJob || (appliedJob && ended <= appliedJob)) return;
+  applyingJob = ended;
+  try {
+    await applyJobEnd(event.job);
+    if (!appliedJob || ended > appliedJob) appliedJob = ended;
     toast(event.job.status === 'done' ? `「${event.job.label}」が終わりました。` : `「${event.job.label}」が失敗しました。ログを見てください。`, event.job.status !== 'done');
+  } catch (error) {
+    toast(`「${event.job.label}」の結果を読み込めませんでした。再接続したときに読み込み直します: ${error.message}`, true);
+  } finally {
+    if (applyingJob === ended) applyingJob = null;
   }
 };
 events.onerror = () => toast('サーバーとの接続が切れました。npm run task:ui が動いているか確認してください。', true);
+
+// Reloads what a job may have changed; throws when the state or the open task could not be read.
+async function applyJobEnd(job) {
+  await refreshState();
+  const target = job.taskId ?? (job.action === 'fetch' ? lastFetched(job) : null);
+  // Switching tasks would discard unsaved edits or retarget an open dialog; the list is
+  // already refreshed above, so the user can open it themselves.
+  const busy = edits.size > 0 || $('veil').classList.contains('on');
+  let loaded = true;
+  if (target && target !== selected) {
+    if (!busy) loaded = await openTask(target);
+  } else if (selected) {
+    // openTask() clears `edits`, so a copy is kept to put the unsaved edits back.
+    const keep = new Map(edits);
+    loaded = await openTask(selected);
+    edits = keep;
+    drawDetail();
+  }
+  if (!loaded) throw new Error('課題の詳細を読み込めませんでした。');
+}
 
 function lastFetched(job) {
   return job.lines.map((line) => line.match(/^task-id:\s*([a-f0-9]{16})/)?.[1]).filter(Boolean).pop() ?? null;
 }
 
 drawDetail();
-refreshState().catch((error) => toast(error.message, true));
+// The server reads the job before the tasks, so a job that has ended in this state is
+// already reflected in it.
+const firstLoad = refreshState()
+  .then(() => { appliedJob = state.job && state.job.status !== 'running' ? state.job.startedAt : null; })
+  .catch((error) => toast(error.message, true));
 </script>
 </body>
 </html>

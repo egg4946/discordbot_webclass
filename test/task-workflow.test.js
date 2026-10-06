@@ -2,16 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { join, resolve } from 'node:path';
 import AdmZip from 'adm-zip';
 import { extractAttachmentText } from '../src/task-extract.js';
-import { decodeChapterList, extractCourseContents, roundNumbers, selectContent } from '../src/task-fetch.js';
+import { decodeChapterList, extractCourseContents, fetchTask, roundNumbers, selectContent } from '../src/task-fetch.js';
 import { collectReports, generateAnswers, isReportQuestion, mergeAnswers, parseSolverOutput, renderReport, renderReports, selectProvider } from '../src/task-answer.js';
 import { markdownToHtml } from '../src/task-report.js';
 import { describeValues, parseQuestionForm, parseQuestionText, questionFingerprint, renderQuestions, validateAnswers } from '../src/task-questions.js';
 import { approveTask, reviewTask, submitTask, verifyUploaded } from '../src/task-submit.js';
-import { answerDigest, readJson, readTask, readText, saveJson, saveTask, saveText, taskDir, taskPath } from '../src/task-store.js';
+import { answerDigest, readJson, readTask, readText, saveJson, saveTask, saveText, taskDir, taskId, taskPath } from '../src/task-store.js';
 import { parseGradeResults, retryTask } from '../src/task-retry.js';
+import { holdLockInChild } from './lock-holder.js';
+
+const require = createRequire(import.meta.url);
 
 // Mirrors the markup of WebClass dqstn_answer_all.php.
 const FORM = `
@@ -411,6 +415,392 @@ test('retry answers only the questions marked wrong and keeps the rest of the su
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    await rm(solver, { force: true });
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+// retry writes twice: generateAnswers saves the solved answers, then retry takes the task lock
+// again to flag an answer that repeats the one marked wrong. `change` runs between the two while
+// a separate process holds the task lock, as a UI save or a submit would. It is started just
+// before the second lock is taken: the lock name is resolved with fs/promises realpath, which
+// is wrapped here once the solved answers are in answer.json.
+async function retryWithChangeBeforeFlagging(id, change) {
+  const questions = parseQuestionForm(FORM).slice(0, 3);
+  const answers = [{ question: 1, values: ['a'] }, { question: 2, values: ['1'] }, { question: 3, values: ['2'] }];
+  const solver = join(tmpdir(), `fake-claude-repeat-${process.pid}.js`);
+  // Gives question 2 the answer that was marked wrong again, so retry flags it.
+  await writeFile(solver, `process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({ result: JSON.stringify({
+    answers: [{ question: 2, values: ['1'], confidence: 'medium', evidence: '' }], reports: [], notes: '' }) })));`);
+  const saved = process.env.CLAUDE_CLI_PATH;
+  process.env.CLAUDE_CLI_PATH = solver;
+  const promises = require('node:fs/promises');
+  const realpath = promises.realpath;
+  let changed = false;
+  promises.realpath = async (...args) => {
+    if (!changed && resolve(String(args[0])) === taskDir(id)) {
+      const solved = await readJson(id, 'answer.json').catch(() => null);
+      if (solved?.answers.find((answer) => answer.question === 2)?.source === 'claude') {
+        changed = true;
+        const other = await holdLockInChild('task', id);
+        try {
+          await change();
+        } finally {
+          await other.release();
+        }
+      }
+    }
+    return realpath(...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await saveTask(id, { id, status: 'submitted', submittedAt: '2026-09-24T00:00:00Z', questions,
+      fingerprint: questionFingerprint(questions), approval: { digest: 'x' },
+      item: { courseName: '授業', title: '課題', deadlineAt: null } });
+    await saveText(id, 'questions.md', renderQuestions(questions));
+    await saveText(id, 'submission-receipt.txt', RECEIPT);
+    await saveJson(id, 'answer.json', { providers: ['claude'], notes: 'AIのメモ', answers });
+    const result = await retryTask(id, { providers: ['claude'] }).catch((error) => error);
+    assert.equal(changed, true, 'the change ran before the flags were written');
+    return result;
+  } finally {
+    promises.realpath = realpath;
+    syncBuiltinESMExports();
+    if (saved === undefined) delete process.env.CLAUDE_CLI_PATH;
+    else process.env.CLAUDE_CLI_PATH = saved;
+    await rm(solver, { force: true });
+  }
+}
+
+const pick = (answer) => answer && { values: answer.values, source: answer.source, conflict: answer.conflict, repeated: answer.repeated };
+
+test('retry never undoes a change to a retried question made just before it flags repeated answers', async () => {
+  const id = 'abcdef012345678a';
+  try {
+    const result = await retryWithChangeBeforeFlagging(id, async () => {
+      const draft = await readJson(id, 'answer.json');
+      await saveJson(id, 'answer.json', { ...draft, answers: draft.answers.map((answer) => (answer.question === 2
+        ? { question: 2, values: ['2'], source: 'user', conflict: false } : answer)) });
+    });
+    assert.deepEqual(result.repeated, [2]);
+    const { answers } = await readJson(id, 'answer.json');
+    // The new answer stays, and is not flagged: it no longer repeats the wrong one.
+    assert.deepEqual(pick(answers.find((answer) => answer.question === 2)),
+      { values: ['2'], source: 'user', conflict: false, repeated: undefined });
+    assert.equal((await readTask(id)).status, 'answered');
+  } finally {
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+test('retry keeps other questions and notes changed just before it flags repeated answers', async () => {
+  const id = 'abcdef012345678b';
+  try {
+    const result = await retryWithChangeBeforeFlagging(id, async () => {
+      const draft = await readJson(id, 'answer.json');
+      await saveJson(id, 'answer.json', { ...draft, notes: 'あとで書いたメモ', answers: draft.answers.map((answer) => (answer.question === 1
+        ? { question: 1, values: ['b'], source: 'user', conflict: false } : answer)) });
+    });
+    assert.deepEqual(result.repeated, [2]);
+    const saved = await readJson(id, 'answer.json');
+    assert.equal(saved.notes, 'あとで書いたメモ');
+    assert.deepEqual(saved.providers, ['claude']);
+    assert.deepEqual(pick(saved.answers.find((answer) => answer.question === 1)),
+      { values: ['b'], source: 'user', conflict: false, repeated: undefined });
+    assert.deepEqual(pick(saved.answers.find((answer) => answer.question === 2)),
+      { values: ['1'], source: 'claude', conflict: true, repeated: true });
+    assert.deepEqual(saved.answers.find((answer) => answer.question === 3).values, ['2']);
+  } finally {
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+test('retry writes nothing once the task was submitted just before it flags repeated answers', async () => {
+  const id = 'abcdef012345678c';
+  try {
+    let submitted = null;
+    let draft = null;
+    const result = await retryWithChangeBeforeFlagging(id, async () => {
+      submitted = { ...(await readTask(id)), status: 'submitted', submittedAt: '2026-10-06T02:00:00.000Z' };
+      await saveTask(id, submitted);
+      draft = await readText(id, 'answer.json');
+    });
+    assert.ok(result instanceof Error);
+    assert.match(result.message, /既に提出処理に入っています \(status: submitted\)。解き直しの結果は保存していません/);
+    assert.deepEqual(await readTask(id), submitted);
+    // answer.json is the record of what was submitted: no flag was added to it.
+    assert.equal(await readText(id, 'answer.json'), draft);
+  } finally {
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+test('a grade row whose answer cell spans lines is still read', () => {
+  const receipt = ['問\t解答\t結果\t得点/配点', '1\t(1) Quality', '(2) Cost\t×\t0/2', '2\t1\t○\t2/2'].join('\r\n');
+  assert.deepEqual(parseGradeResults(receipt), [
+    { question: 1, answer: '(1) Quality\n(2) Cost', mark: '×', score: 0, max: 2 },
+    { question: 2, answer: '1', mark: '○', score: 2, max: 2 },
+  ]);
+});
+
+test('numbered lists split by a blank line keep their numbers', () => {
+  const html = markdownToHtml('1. 一つ目\n\n2. 二つ目\n   続き');
+  assert.match(html, /<ol>\n<li>一つ目<\/li>\n<\/ol>/);
+  assert.match(html, /<ol start="2">\n<li>二つ目 続き<\/li>/);
+});
+
+test('dollar signs in the report text are kept as written', () => {
+  // $&, $1, $` and $' mean something to String.replace; the report must not be rewritten by them.
+  const text = "シェル変数 $ と $& と $1 と $` と $' と $$";
+  const escaped = "シェル変数 $ と $&amp; と $1 と $` と $' と $$";
+  const html = markdownToHtml(`- 項目 ${text}\n  続き ${text}\n\n本文 ${text}\n\n| 列 |\n| --- |\n| ${text} |`);
+  assert.ok(html.includes(`<li>項目 ${escaped} 続き ${escaped}</li>`), html);
+  assert.ok(html.includes(`<p>本文 ${escaped}</p>`), html);
+  assert.ok(html.includes(`<td>${escaped}</td>`), html);
+});
+
+test('the task id shown by list selects its content', () => {
+  const contents = [{ contentsId: 'a'.repeat(32), courseName: '授業', title: '課題', category: 'テスト' },
+    { contentsId: 'b'.repeat(32), courseName: '授業', title: '課題2', category: 'テスト' }];
+  assert.equal(selectContent(contents, taskId('b'.repeat(32))).contentsId, 'b'.repeat(32));
+});
+
+test('submit, review and select refuse early and never open WebClass', async () => {
+  const id = 'abcdef0123456784';
+  const questions = parseQuestionForm(FORM).slice(0, 3);
+  const answers = [{ question: 1, values: ['a'] }, { question: 2, values: ['1'] }, { question: 3, values: ['2'] }];
+  try {
+    await saveTask(id, { id, status: 'fetch-error', item: { courseName: '授業', title: '課題', deadlineAt: null } });
+    await assert.rejects(reviewTask(id), /設問がありません/);
+    await assert.rejects(approveTask(id, '0'.repeat(16)), /設問がありません/);
+
+    await saveTask(id, { id, status: 'submitted', questions, fingerprint: questionFingerprint(questions),
+      item: { courseName: '授業', title: '課題', deadlineAt: null } });
+    await saveJson(id, 'answer.json', { providers: ['claude'], answers });
+    await assert.rejects(submitTask({}, id), /既に提出処理に入っています/);
+    // Another submit / dry-run / fetch holds the lock: this one stops before reading anything.
+    const other = await holdLockInChild('task', id);
+    await assert.rejects(submitTask({}, id, { dryRun: true }), /既に実行中/);
+    await other.release();
+
+    await saveTask(id, { ...(await readTask(id)), status: 'answered' });
+    await saveJson(id, 'answer.json', { answers });
+    await assert.rejects(selectProvider(id, '../../../x'), /claude \/ codex/);
+    await saveJson(id, 'answer-claude.json', { provider: 'claude', answers, reports: [] });
+    assert.deepEqual((await selectProvider(id, 'claude')).providers, ['claude']);
+  } finally {
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+test('answer drops the old answer of a solver that failed this time', async () => {
+  const id = 'abcdef0123456785';
+  const questions = parseQuestionForm(FORM).slice(0, 3);
+  const answers = [{ question: 1, values: ['a'] }, { question: 2, values: ['1'] }, { question: 3, values: ['2'] }];
+  const claude = join(tmpdir(), `fake-claude-ok-${process.pid}.js`);
+  const codex = join(tmpdir(), `fake-codex-fail-${process.pid}.js`);
+  await writeFile(claude, `process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({ result: JSON.stringify({
+    answers: ${JSON.stringify(answers)}, reports: [], notes: '' }) })));`);
+  await writeFile(codex, 'process.exit(1);');
+  const saved = { claude: process.env.CLAUDE_CLI_PATH, codex: process.env.CODEX_CLI_PATH };
+  process.env.CLAUDE_CLI_PATH = claude;
+  process.env.CODEX_CLI_PATH = codex;
+  try {
+    await saveTask(id, { id, status: 'fetched', questions, item: { courseName: '授業', title: '課題', deadlineAt: null } });
+    await saveText(id, 'questions.md', renderQuestions(questions));
+    await saveJson(id, 'answer-codex.json', { provider: 'codex', answers, reports: [] });
+    const { results } = await generateAnswers(id, ['claude', 'codex']);
+    assert.ok(results.find((result) => result.provider === 'codex').error);
+    await assert.rejects(readJson(id, 'answer-codex.json'));
+    assert.equal((await readJson(id, 'answer-claude.json')).answers.length, 3);
+  } finally {
+    for (const [key, value] of [['CLAUDE_CLI_PATH', saved.claude], ['CODEX_CLI_PATH', saved.codex]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(claude, { force: true });
+    await rm(codex, { force: true });
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+test('retry refuses grade-table questions that the task does not have', async () => {
+  const id = 'abcdef0123456786';
+  const questions = parseQuestionForm(FORM).slice(0, 1);
+  try {
+    await saveTask(id, { id, status: 'submitted', questions, item: { courseName: '授業', title: '課題', deadlineAt: null } });
+    await saveJson(id, 'answer.json', { answers: [{ question: 1, values: ['a'] }] });
+    await saveText(id, 'submission-receipt.txt', '問\t解答\t結果\t得点/配点\n1\ta\t○\t2/2\n9\tb\t×\t0/2');
+    await assert.rejects(retryTask(id, { providers: ['claude'] }), /設問番号 9 が取得した設問にありません/);
+    await assert.rejects(readText(id, 'attempts/1/submission-receipt.txt'));
+  } finally {
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+const FETCH_CONTENTS_ID = 'f0'.repeat(16);
+const FETCH_COURSE_ID = 'c0'.repeat(16);
+// Never reached by these tests; a closed local port in case a check is missing.
+const OFFLINE_CONFIG = { headless: true, webclassLoginUrl: 'http://127.0.0.1:9/' };
+
+// A WebClass session for fetchTask without a browser: one course with one report whose
+// answer form is `form` (null: no form, so the fetch fails). `onOpen` runs when the report is
+// opened, i.e. while the fetch is on WebClass and has read task.json but not written it yet.
+function fakeSession({ form = FORM, onOpen = async () => {} } = {}) {
+  const origin = 'https://webclass.nanzan-u.ac.jp';
+  const list = `<div class="cl-contentsList_listGroupItem" data-end-date="4102444740" data-exec-count="0">
+    <div class="cm-contentsList_contentName"><a href="/webclass/do_contents.php?set_contents_id=${FETCH_CONTENTS_ID}">第1回課題</a></div>
+    <span class="cl-contentsList_categoryLabel">レポート</span></div>`;
+  const locator = () => ({ first: locator, isVisible: async () => false, innerText: async () => '', count: async () => 0 });
+  const frame = { url: () => `${origin}/webclass/dqstn_answer_all.php`, content: async () => form, waitForLoadState: async () => {}, locator };
+  let opened = false;
+  const page = {
+    on() {},
+    url: () => origin,
+    locator,
+    goto: async (url) => {
+      if (url.includes(`set_contents_id=${FETCH_CONTENTS_ID}`)) {
+        await onOpen();
+        opened = true;
+      }
+    },
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    $$eval: async () => [{ href: `${origin}/webclass/course.php/${FETCH_COURSE_ID}/login`, name: '授業' }],
+    content: async () => list,
+    frames: () => (opened && form ? [frame] : []),
+  };
+  return async () => ({ browser: { close: async () => {} }, page });
+}
+
+function approvedTask(id) {
+  const questions = parseQuestionForm(FORM).slice(0, 3);
+  return { id, status: 'approved', approval: { digest: 'not-the-current-one', at: '2026-10-06T00:00:00.000Z' },
+    questions, fingerprint: questionFingerprint(questions), layout: 'single', materials: [],
+    item: { contentsId: FETCH_CONTENTS_ID, courseId: FETCH_COURSE_ID, courseName: '授業', title: '第1回課題', category: 'レポート', deadlineAt: '2100-01-01T00:00:00.000Z' } };
+}
+
+test('a fetch never undoes a submission recorded while it was on WebClass', async () => {
+  const id = taskId(FETCH_CONTENTS_ID);
+  const submittedAt = '2026-10-06T01:00:00.000Z';
+  // What a submit in another process leaves behind when it finishes during the fetch.
+  const submitElsewhere = async () => saveTask(id, { ...(await readTask(id)), status: 'submitted', submittedAt });
+  try {
+    for (const form of [null, FORM]) {
+      await saveTask(id, approvedTask(id));
+      await assert.rejects(fetchTask({}, FETCH_CONTENTS_ID, { materials: false, openSession: fakeSession({ form, onOpen: submitElsewhere }) }));
+      const task = await readTask(id);
+      assert.equal(task.status, 'submitted', form ? 'successful fetch' : 'failed fetch');
+      assert.equal(task.submittedAt, submittedAt);
+      // So the task can never be submitted a second time.
+      await assert.rejects(submitTask(OFFLINE_CONFIG, id), /既に提出処理に入っています/);
+    }
+  } finally {
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+test('fetch and submit of one task never run at the same time', async () => {
+  const id = taskId(FETCH_CONTENTS_ID);
+  try {
+    await saveTask(id, approvedTask(id));
+    let submitDuringFetch = null;
+    const onOpen = async () => {
+      submitDuringFetch = await submitTask(OFFLINE_CONFIG, id).then(() => 'started', (error) => error.message);
+    };
+    await fetchTask({}, FETCH_CONTENTS_ID, { materials: false, openSession: fakeSession({ onOpen }) });
+    assert.match(submitDuringFetch, /既に実行中/);
+    assert.equal((await readTask(id)).status, 'fetched');
+
+    // A running submit (another process) holds the task lock: the fetch stops before writing anything.
+    await saveTask(id, approvedTask(id));
+    const submit = await holdLockInChild('task', id);
+    try {
+      await assert.rejects(fetchTask({}, FETCH_CONTENTS_ID, { materials: false, openSession: fakeSession() }), /既に実行中/);
+    } finally {
+      await submit.release();
+    }
+    assert.deepEqual(await readTask(id), approvedTask(id));
+  } finally {
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+test('an answer run never undoes a submission that finished while the AI was solving', async () => {
+  const id = 'abcdef0123456787';
+  const questions = parseQuestionForm(FORM).slice(0, 3);
+  const submitted = [{ question: 1, values: ['提出した'] }, { question: 2, values: ['1'] }, { question: 3, values: ['2'] }];
+  const solved = [{ question: 1, values: ['新しい'] }, { question: 2, values: ['2'] }, { question: 3, values: ['1'] }];
+  const claude = join(tmpdir(), `fake-claude-submit-${process.pid}.js`);
+  // The solver marks the task submitted, as a submit in another process would meanwhile.
+  await writeFile(claude, `const fs = require('node:fs');
+    process.stdin.resume();
+    process.stdin.on('end', () => {
+      const path = ${JSON.stringify(taskPath(id, 'task.json'))};
+      const task = JSON.parse(fs.readFileSync(path, 'utf8'));
+      fs.writeFileSync(path, JSON.stringify({ ...task, status: 'submitted', submittedAt: '2026-10-06T01:00:00.000Z' }));
+      console.log(JSON.stringify({ result: JSON.stringify({ answers: ${JSON.stringify(solved)}, reports: [], notes: '' }) }));
+    });`);
+  const saved = process.env.CLAUDE_CLI_PATH;
+  process.env.CLAUDE_CLI_PATH = claude;
+  try {
+    await saveTask(id, { id, status: 'answered', questions, fingerprint: questionFingerprint(questions), item: { courseName: '授業', title: '課題', deadlineAt: null } });
+    await saveText(id, 'questions.md', renderQuestions(questions));
+    await saveJson(id, 'answer.json', { providers: ['claude'], answers: submitted });
+    await assert.rejects(generateAnswers(id, ['claude']), /既に提出処理に入っています/);
+    assert.equal((await readTask(id)).status, 'submitted');
+    // answer.json is the record of what was submitted.
+    assert.deepEqual((await readJson(id, 'answer.json')).answers, submitted);
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CLI_PATH;
+    else process.env.CLAUDE_CLI_PATH = saved;
+    await rm(claude, { force: true });
+    await rm(taskDir(id), { recursive: true, force: true });
+  }
+});
+
+test('while a submit holds the task lock, approve, select, answer, render and retry change nothing', async () => {
+  const id = 'abcdef0123456788';
+  const questions = parseQuestionForm(FORM).slice(0, 3);
+  const answers = [{ question: 1, values: ['a'] }, { question: 2, values: ['1'] }, { question: 3, values: ['2'] }];
+  const claude = join(tmpdir(), `fake-claude-fail-${process.pid}.js`);
+  const solver = join(tmpdir(), `fake-claude-lock-${process.pid}.js`);
+  await writeFile(claude, 'process.exit(1);');
+  await writeFile(solver, `process.stdin.resume();
+    process.stdin.on('end', () => console.log(JSON.stringify({ result: JSON.stringify({
+      answers: [{ question: 1, values: ['新しい'] }, { question: 2, values: ['2'] }, { question: 3, values: ['1'] }], reports: [], notes: '' }) })));`);
+  const saved = process.env.CLAUDE_CLI_PATH;
+  process.env.CLAUDE_CLI_PATH = claude;
+  let submit = null;
+  try {
+    const answered = { id, status: 'answered', questions, fingerprint: questionFingerprint(questions), item: { courseName: '授業', title: '課題', deadlineAt: null } };
+    await saveTask(id, answered);
+    await saveJson(id, 'answer.json', { providers: ['claude'], answers });
+    await saveJson(id, 'answer-claude.json', { provider: 'claude', answers, reports: [] });
+    const { digest } = await reviewTask(id);
+    submit = await holdLockInChild('task', id);
+    await assert.rejects(approveTask(id, digest), /既に実行中/);
+    await assert.rejects(selectProvider(id, 'claude'), /既に実行中/);
+    await assert.rejects(renderReport(id), /既に実行中/);
+    // The AI run finishes while the lock is held: its result is not written.
+    process.env.CLAUDE_CLI_PATH = solver;
+    await saveText(id, 'questions.md', renderQuestions(questions));
+    await assert.rejects(generateAnswers(id, ['claude']), /既に実行中/);
+    process.env.CLAUDE_CLI_PATH = claude;
+    assert.deepEqual(await readTask(id), answered);
+    assert.deepEqual((await readJson(id, 'answer.json')).answers, answers);
+
+    const submitted = { ...answered, status: 'submitted', submittedAt: '2026-10-06T01:00:00.000Z' };
+    await saveTask(id, submitted);
+    await saveText(id, 'submission-receipt.txt', '問\t解答\t結果\t得点/配点\n1\ta\t×\t0/2');
+    await assert.rejects(retryTask(id, { providers: ['claude'] }), /既に実行中/);
+    assert.deepEqual(await readTask(id), submitted);
+    await assert.rejects(readText(id, 'attempts/1/submission-receipt.txt'));
+  } finally {
+    await submit?.release();
+    if (saved === undefined) delete process.env.CLAUDE_CLI_PATH;
+    else process.env.CLAUDE_CLI_PATH = saved;
+    await rm(claude, { force: true });
     await rm(solver, { force: true });
     await rm(taskDir(id), { recursive: true, force: true });
   }

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { writeJsonFile } from './json-file.js';
+import { acquireRunLock } from './run-lock.js';
 
 // Task data contains assignment text and answers, so it lives under the Git-ignored data/.
 export const TASK_ROOT = resolve('data/tasks');
@@ -39,6 +40,31 @@ export async function assertNotSubmitted(id, what) {
   if (task) {
     throw new Error(`この課題は既に提出処理に入っています (status: ${task.status})。${what}`);
   }
+}
+
+// One lock per task, across processes (the UI's jobs and the CLI). submit and fetch hold it for
+// their whole run: both open the task on WebClass and both write task.json from what they read
+// at the start. Commands that turn the task back into a draft hold it while they write.
+export async function withTaskLock(id, run) {
+  const release = await acquireRunLock(taskPath(id, 'task.lock'));
+  if (!release) {
+    throw new Error('この課題では提出・取得などの処理が既に実行中です。終わってからやり直してください。');
+  }
+  try {
+    return await run();
+  } finally {
+    await release();
+  }
+}
+
+// The writes of a command that makes the task a draft again. The submission check is repeated
+// under the lock, so a submission that finished while the command ran (an AI run takes minutes)
+// is never undone.
+export async function writeUnsubmitted(id, what, write) {
+  return withTaskLock(id, async () => {
+    await assertNotSubmitted(id, what);
+    return write();
+  });
 }
 
 export async function saveTask(id, value) {

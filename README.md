@@ -82,8 +82,7 @@ discordbot_webclass/
 ├── data/                       # 実行時に作成（Git管理外）
 │   ├── state.json              # 課題と通知済み情報
 │   ├── runtime-status.json     # 最終巡回成功時刻、連続失敗数
-│   ├── mutes.json              # ミュート中の授業
-│   └── check.lock              # 二重実行防止
+│   └── mutes.json              # ミュート中の授業
 ├── logs/                       # 実行時に作成（Git管理外）
 └── .env                        # トークン・ID・パスワード（Git管理外）
 ```
@@ -152,6 +151,8 @@ npm run check                 # 手動で1回実行
 ```
 
 成功時は `Done. assignments=2 notifications=0` のように出力されます。`notifications=0` は、通知条件に該当する課題がなかったという意味で、エラーではありません。
+
+前回の巡回がまだ動いている間に次の巡回が始まると、`Another WebClass check is already running. This run was skipped.` と出して何もせずに終わります。この二重実行防止のロックはファイルではなくOS（Linuxの抽象名前空間のUnixソケット、Windowsの名前付きパイプ）が持つため、巡回のプロセスが強制終了されても残らず、手で消すものはありません。古い版が残した `data/check.lock` ファイルは使われないので削除して構いません。
 
 ### ログの整理
 
