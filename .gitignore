@@ -4,4 +4,6 @@ data/
 debug/
 playwright-report/
 test-results/
+output/
+tmp/
 *.log
